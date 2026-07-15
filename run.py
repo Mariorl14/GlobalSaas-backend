@@ -13,4 +13,4 @@ if __name__ == "__main__":
         "yes",
         "on",
     }
-    app.run(host="0.0.0.0", port=port, debug=debug)
+    app.run(host="0.0.0.0", port=port, debug=debug, threaded=True)

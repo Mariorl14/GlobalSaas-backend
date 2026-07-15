@@ -310,13 +310,25 @@ def shop_insights(ctx: ShopContext):
     range_key = (request.args.get("range") or "today").strip().lower()
     from_dt = _parse_dt(request.args.get("from"))
     to_dt = _parse_dt(request.args.get("to"))
-    payload = build_insights(
-        ctx.business_id,
-        range_key=range_key,
-        from_dt=from_dt,
-        to_dt=to_dt,
-    )
-    return jsonify(payload), 200
+    try:
+        payload = build_insights(
+            ctx.business_id,
+            range_key=range_key,
+            from_dt=from_dt,
+            to_dt=to_dt,
+        )
+        return jsonify(payload), 200
+    except Exception as exc:
+        db.session.rollback()
+        return (
+            jsonify(
+                {
+                    "error": "No se pudieron calcular los insights.",
+                    "detail": str(exc),
+                }
+            ),
+            500,
+        )
 
 
 @shop_api.route("/insights/goals", methods=["GET", "PUT"])

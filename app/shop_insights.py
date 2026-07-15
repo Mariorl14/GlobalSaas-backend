@@ -162,6 +162,226 @@ def _appt_price(appt: Appointment, price_map: dict[UUID, float]) -> float:
     return price_map.get(appt.service_type_id, 0.0)
 
 
+def _empty_insights_payload(
+    *,
+    start: datetime,
+    end: datetime,
+    label: str,
+    now: datetime,
+    goals: dict,
+    employees: list[Employee],
+    products: list[InventoryProduct],
+) -> dict:
+    """Lightweight response for brand-new shops (no appts/clients/sales yet)."""
+    active_products = [p for p in products if p.is_active]
+    cost_value = 0.0
+    retail_value = 0.0
+    low_stock: list[dict] = []
+    out_of_stock: list[dict] = []
+    for p in active_products:
+        stock = int(p.stock or 0)
+        price = _money(p.price)
+        cost = _money(p.unit_cost) if p.unit_cost is not None else 0.0
+        retail_value += stock * price
+        cost_value += stock * cost
+        if stock <= 0:
+            out_of_stock.append(
+                {"id": str(p.id), "name": p.name, "stock": stock, "min_stock": p.min_stock}
+            )
+        elif stock <= int(p.min_stock or 0):
+            low_stock.append(
+                {"id": str(p.id), "name": p.name, "stock": stock, "min_stock": p.min_stock}
+            )
+
+    remaining_units = sum(int(p.stock or 0) for p in active_products)
+    day_count = max(1, (end - start).days)
+    series = []
+    cursor = start
+    while cursor < end and len(series) < 62:
+        nxt = cursor + timedelta(days=1)
+        series.append(
+            {
+                "date": cursor.strftime("%Y-%m-%d"),
+                "label": cursor.strftime("%d/%m"),
+                "revenue": 0.0,
+                "appointments": 0,
+                "average_ticket": 0.0,
+            }
+        )
+        cursor = nxt
+
+    staff_rows = []
+    for i, e in enumerate(employees):
+        if not e.is_active:
+            continue
+        staff_rows.append(
+            {
+                "employee_id": str(e.id),
+                "display_name": e.display_name or "Staff",
+                "revenue": 0.0,
+                "appointments_completed": 0,
+                "appointments_total": 0,
+                "average_ticket": 0.0,
+                "average_review": None,
+                "occupancy": 0.0,
+                "completion_rate": None,
+                "rank": i + 1,
+            }
+        )
+
+    goals_progress = {
+        "monthly_revenue": {
+            "target": goals["monthly_revenue"],
+            "current": 0.0,
+            "pct": 0.0,
+        },
+        "monthly_appointments": {
+            "target": goals["monthly_appointments"],
+            "current": 0.0,
+            "pct": 0.0,
+        },
+        "monthly_product_sales": {
+            "target": goals["monthly_product_sales"],
+            "current": 0.0,
+            "pct": 0.0,
+            "available": goals["monthly_product_sales"] > 0,
+        },
+        "monthly_new_customers": {
+            "target": goals["monthly_new_customers"],
+            "current": 0.0,
+            "pct": 0.0,
+        },
+    }
+
+    return {
+        "period": {
+            "range": label,
+            "from": start.isoformat() + "Z",
+            "to": (end - timedelta(microseconds=1)).isoformat() + "Z",
+            "from_exclusive_end": end.isoformat() + "Z",
+        },
+        "meta": {
+            "currency_note": (
+                "Ingresos netos = servicios (POS + citas sin ticket) + productos "
+                "− descuentos + impuestos."
+            ),
+            "unavailable": ["tips", "reviews", "actual_payments"],
+            "generated_at": now.isoformat() + "Z",
+        },
+        "snapshot": {
+            "revenue": 0.0,
+            "revenue_delta_pct": None,
+            "service_revenue": 0.0,
+            "product_revenue": 0.0,
+            "pos_service_revenue": 0.0,
+            "discount_total": 0.0,
+            "tax_total": 0.0,
+            "appointments": 0,
+            "appointments_delta_pct": None,
+            "customers_served": 0,
+            "customers_served_delta_pct": None,
+            "products_sold": 0,
+            "products_sold_delta_pct": None,
+            "services_sold": 0,
+            "average_ticket": 0.0,
+            "average_ticket_delta_pct": None,
+            "occupancy_rate": None,
+            "occupancy_delta_pct": None,
+        },
+        "series": series or [
+            {
+                "date": start.strftime("%Y-%m-%d"),
+                "label": start.strftime("%d/%m"),
+                "revenue": 0.0,
+                "appointments": 0,
+                "average_ticket": 0.0,
+            }
+        ],
+        "revenue_breakdown": [
+            {
+                "key": "services",
+                "label": "Servicios",
+                "amount": 0.0,
+                "pct": 0.0,
+                "available": True,
+            },
+            {
+                "key": "products",
+                "label": "Productos",
+                "amount": 0.0,
+                "pct": 0.0,
+                "available": True,
+            },
+            {
+                "key": "tips",
+                "label": "Propinas",
+                "amount": 0.0,
+                "pct": 0.0,
+                "available": False,
+                "note": "Aún no se registran propinas",
+            },
+        ],
+        "top_services": [],
+        "staff_performance": staff_rows[:12],
+        "customers": {
+            "total": 0,
+            "new": 0,
+            "returning": 0,
+            "retention_pct": None,
+            "avg_visit_frequency": 0.0,
+            "inactive_30": 0,
+            "inactive_60": 0,
+            "inactive_90": 0,
+            "highest_spending": None,
+            "most_loyal": None,
+            "average_customer_value": 0.0,
+        },
+        "inventory": {
+            "inventory_cost": round(cost_value, 2),
+            "potential_revenue": round(retail_value, 2),
+            "projected_gross_profit": round(retail_value - cost_value, 2),
+            "products_remaining": remaining_units,
+            "sku_count": len(active_products),
+            "products_sold": 0,
+            "product_revenue": 0.0,
+            "product_gross_profit": 0.0,
+            "avg_product_sale_value": 0.0,
+            "sell_through_rate": None,
+            "best_selling_product": None,
+            "slowest_selling_product": None,
+            "projected_product_revenue_month": 0.0,
+            "low_stock": low_stock,
+            "out_of_stock": out_of_stock,
+            "note": "Valores de inventario basados en stock y precios actuales.",
+        },
+        "projections": {
+            "today": 0.0,
+            "week": 0.0,
+            "month": 0.0,
+            "year": 0.0,
+            "is_estimate": True,
+            "note": f"Sin actividad aún · periodo de {day_count} día(s).",
+        },
+        "goals": goals,
+        "goals_progress": goals_progress,
+        "health": {
+            "score": 50,
+            "label": "Nuevo",
+            "observations": [
+                {
+                    "tone": "info",
+                    "text": "Agenda la primera cita para empezar a medir el pulso del negocio.",
+                }
+            ],
+        },
+        "insights": [
+            "Agenda más citas y completa servicios para desbloquear insights de crecimiento."
+        ],
+        "upcoming_appointments": [],
+        "empty": True,
+    }
+
+
 def build_insights(
     business_id: UUID,
     *,
@@ -184,6 +404,38 @@ def build_insights(
     emp_name = {e.id: e.display_name for e in employees}
 
     products = InventoryProduct.query.filter_by(business_id=business_id).all()
+
+    # Brand-new shops: skip the heavy analytics path (many POS/sale queries).
+    has_appointment = (
+        db.session.query(Appointment.id)
+        .filter(Appointment.business_id == business_id)
+        .first()
+        is not None
+    )
+    has_client = (
+        db.session.query(Client.id).filter(Client.business_id == business_id).first()
+        is not None
+    )
+    has_sale = False
+    try:
+        has_sale = (
+            db.session.query(Sale.id).filter(Sale.business_id == business_id).first()
+            is not None
+        )
+    except Exception:
+        db.session.rollback()
+        has_sale = False
+
+    if not has_appointment and not has_client and not has_sale:
+        return _empty_insights_payload(
+            start=start,
+            end=end,
+            label=label,
+            now=now,
+            goals=goals,
+            employees=employees,
+            products=products,
+        )
 
     # Always cover calendar month + hist window so goals/projections are not truncated
     # when the Insights range is "today" / a short custom range.
