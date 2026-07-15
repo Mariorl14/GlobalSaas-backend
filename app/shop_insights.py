@@ -401,7 +401,7 @@ def build_insights(
     name_map = {s.id: s.name for s in services}
 
     employees = Employee.query.filter_by(business_id=business_id).all()
-    emp_name = {e.id: e.display_name for e in employees}
+    emp_name = {e.id: (e.display_name or "Staff") for e in employees}
 
     products = InventoryProduct.query.filter_by(business_id=business_id).all()
 
@@ -915,7 +915,7 @@ def build_insights(
         staff_rows.append(
             {
                 "employee_id": str(eid),
-                "display_name": emp_name.get(eid, "Barbero"),
+                "display_name": emp_name.get(eid) or "Staff",
                 "revenue": revenue,
                 "appointments_completed": completed,
                 "appointments_total": agg["total"],
@@ -936,7 +936,7 @@ def build_insights(
             staff_rows.append(
                 {
                     "employee_id": str(e.id),
-                    "display_name": e.display_name,
+                    "display_name": e.display_name or "Staff",
                     "revenue": 0.0,
                     "appointments_completed": 0,
                     "appointments_total": 0,
