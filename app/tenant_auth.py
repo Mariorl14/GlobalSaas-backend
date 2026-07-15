@@ -6,7 +6,7 @@ import uuid
 from functools import wraps
 from typing import Callable, NamedTuple, Optional, Tuple, TypeVar
 
-from flask import jsonify
+from flask import jsonify, request
 from flask_jwt_extended import get_jwt, get_jwt_identity, jwt_required
 
 # DB roles for tenant users (maps to product language: shop_admin, barber_staff)
@@ -60,6 +60,9 @@ def shop_jwt_required(fn: F) -> F:
     @wraps(fn)
     @jwt_required()
     def decorated(*args, **kwargs):
+        # Browser CORS preflight has no Authorization header.
+        if request.method == "OPTIONS":
+            return "", 200
         ctx, err = get_shop_context()
         if err is not None:
             return err[0], err[1]
@@ -72,6 +75,8 @@ def shop_admin_required(fn: F) -> F:
     @wraps(fn)
     @jwt_required()
     def decorated(*args, **kwargs):
+        if request.method == "OPTIONS":
+            return "", 200
         ctx, err = get_shop_context()
         if err is not None:
             return err[0], err[1]

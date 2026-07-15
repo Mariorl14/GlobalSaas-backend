@@ -22,7 +22,15 @@ def create_app():
     db.init_app(app)
     migrate.init_app(app, db)
     jwt.init_app(app)
-    CORS(app)
+    # Cross-origin browser calls from Vercel must be allowed to send JWT + JSON body.
+    CORS(
+        app,
+        resources={r"/*": {"origins": "*"}},
+        supports_credentials=False,
+        allow_headers=["Authorization", "Content-Type", "Accept", "Origin", "X-Requested-With"],
+        methods=["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+        expose_headers=["Content-Type"],
+    )
 
     from .routes import main
     from .auth_routes import auth
