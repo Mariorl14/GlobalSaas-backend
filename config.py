@@ -52,3 +52,15 @@ class Config:
     TWILIO_REQUEST_TIMEOUT = int(os.getenv("TWILIO_REQUEST_TIMEOUT", "10"))
     # Fallback ISO 3166-1 alpha-2 when business.country_code is unset.
     DEFAULT_PHONE_COUNTRY_CODE = (os.getenv("DEFAULT_PHONE_COUNTRY_CODE") or "").strip().upper()
+
+    # Email appointment confirmations (SMTP)
+    EMAIL_NOTIFICATIONS_ENABLED = _env_bool("EMAIL_NOTIFICATIONS_ENABLED", False)
+    MAIL_SERVER = os.getenv("MAIL_SERVER")
+    MAIL_PORT = int(os.getenv("MAIL_PORT", "587"))
+    MAIL_USE_TLS = _env_bool("MAIL_USE_TLS", True)
+    MAIL_USE_SSL = _env_bool("MAIL_USE_SSL", False)
+    MAIL_USERNAME = os.getenv("MAIL_USERNAME")
+    MAIL_PASSWORD = os.getenv("MAIL_PASSWORD")
+    MAIL_DEFAULT_SENDER = os.getenv("MAIL_DEFAULT_SENDER")
+    MAIL_DEFAULT_SENDER_NAME = os.getenv("MAIL_DEFAULT_SENDER_NAME", "Barber Suite")
+    MAIL_TIMEOUT = int(os.getenv("MAIL_TIMEOUT", "15"))

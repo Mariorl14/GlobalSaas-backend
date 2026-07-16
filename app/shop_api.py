@@ -23,7 +23,7 @@ from app.models import (
     User,
 )
 from app.tenant_auth import ShopContext, shop_admin_required, shop_jwt_required
-from app.appointment_notifications import send_appointment_confirmation
+from app.appointment_notifications import notify_appointment_created
 from app.shop_insights import build_insights, parse_goals, serialize_goals
 from app.inventory_movements import (
     InventoryMovementError,
@@ -454,9 +454,11 @@ def create_appointment(ctx: ShopContext):
             db.session.rollback()
             return _json_error(exc.message, exc.status_code)
     db.session.commit()
-    notification_result = send_appointment_confirmation(a)
+    notification_result = notify_appointment_created(a)
     payload = _appointment_to_dict(a)
     payload["notification_status"] = notification_result.get("status")
+    payload["email_notification_status"] = notification_result.get("email")
+    payload["whatsapp_notification_status"] = notification_result.get("whatsapp")
     return jsonify(payload), 201
 
 

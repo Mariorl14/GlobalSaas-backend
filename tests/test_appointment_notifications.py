@@ -179,7 +179,7 @@ class TestAppointmentNotifications:
 
 
 class TestPublicBookingIntegration:
-    @patch("app.public_booking.send_appointment_confirmation")
+    @patch("app.public_booking.notify_appointment_created")
     def test_validation_failure_sends_nothing(self, mock_send, client, app):
         bundle = create_tenant_bundle()
         with app.app_context():
@@ -190,7 +190,10 @@ class TestPublicBookingIntegration:
         assert resp.status_code == 400
         mock_send.assert_not_called()
 
-    @patch("app.public_booking.send_appointment_confirmation", return_value={"status": "sent"})
+    @patch(
+        "app.public_booking.notify_appointment_created",
+        return_value={"status": "sent", "email": "sent", "whatsapp": "skipped"},
+    )
     @patch("app.public_booking._slot_is_bookable", return_value=True)
     def test_successful_booking_calls_notification_after_commit(
         self, _mock_slot, mock_send, client, app
@@ -218,6 +221,7 @@ class TestPublicBookingIntegration:
         assert resp.status_code == 201
         body = resp.get_json()
         assert body["notification_status"] == "sent"
+        assert body["email_notification_status"] == "sent"
         mock_send.assert_called_once()
 
 

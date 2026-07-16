@@ -17,7 +17,7 @@ from sqlalchemy import and_, func, text
 
 from app.extensions import db
 from app.models import Appointment, Business, Client, Employee, ServiceType
-from app.appointment_notifications import send_appointment_confirmation
+from app.appointment_notifications import notify_appointment_created
 
 public_booking = Blueprint("public_booking", __name__, url_prefix="/api/public")
 
@@ -613,7 +613,7 @@ def create_public_booking(slug: str):
     client.appointments_amount = (client.appointments_amount or 0) + 1
     db.session.commit()
 
-    notification_result = send_appointment_confirmation(appt)
+    notification_result = notify_appointment_created(appt)
 
     return (
         jsonify(
@@ -622,6 +622,8 @@ def create_public_booking(slug: str):
                 "message": "Reserva confirmada.",
                 "employee_id": str(chosen.id),
                 "notification_status": notification_result.get("status"),
+                "email_notification_status": notification_result.get("email"),
+                "whatsapp_notification_status": notification_result.get("whatsapp"),
             }
         ),
         201,
