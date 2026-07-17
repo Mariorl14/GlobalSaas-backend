@@ -7,6 +7,7 @@ from werkzeug.security import check_password_hash, generate_password_hash
 
 from app.extensions import db
 from app.models import Employee, User
+from app.name_utils import user_full_name
 
 
 auth = Blueprint("auth", __name__)
@@ -33,6 +34,9 @@ def _json_user(user: User):
     return {
         "id": str(user.id),
         "email": user.email,
+        "first_name": user.first_name,
+        "last_name": user.last_name,
+        "full_name": user_full_name(user),
         "role": user.role,
         "business_id": _uuid_to_str_or_none(user.business_id),
         "is_active": user.is_active,

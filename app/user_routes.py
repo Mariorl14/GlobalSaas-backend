@@ -5,6 +5,7 @@ from werkzeug.security import generate_password_hash
 
 from app.extensions import db
 from app.models import Business, Employee, User
+from app.name_utils import staff_display_label, user_full_name
 
 
 user_routes = Blueprint("user_routes", __name__)
@@ -27,12 +28,24 @@ def _uuid_to_str_or_none(value):
     return str(value) if value is not None else None
 
 
+def _sync_employee_display_name(user: User) -> None:
+    """Keep Employee.display_name aligned with user first/last name when set."""
+    if user.employee is None:
+        return
+    full = user_full_name(user)
+    if full:
+        user.employee.display_name = full[:120]
+
+
 def _user_employee_to_dict(user: User):
     employee = user.employee
     return {
         "user": {
             "id": str(user.id),
             "email": user.email,
+            "first_name": user.first_name,
+            "last_name": user.last_name,
+            "full_name": user_full_name(user),
             "role": user.role,
             "business_id": _uuid_to_str_or_none(user.business_id),
             "is_active": user.is_active,
@@ -42,6 +55,8 @@ def _user_employee_to_dict(user: User):
                 "id": str(employee.id),
                 "user_id": str(employee.user_id),
                 "business_id": str(employee.business_id),
+                "display_name": employee.display_name,
+                "label": staff_display_label(employee, user),
             }
             if employee is not None
             else None
@@ -66,11 +81,15 @@ def create_user():
 
     email = user_payload.get("email")
     password = user_payload.get("password")
+    first_name = (user_payload.get("first_name") or "").strip() or None
+    last_name = (user_payload.get("last_name") or "").strip() or None
     is_active = user_payload.get("is_active", True)
     role = (user_payload.get("role") or payload.get("role") or "employee").strip()
 
     if not email or not password:
         return _json_error("Missing required fields: user.email, user.password", 400)
+    if not first_name:
+        return _json_error("Missing required field: user.first_name", 400)
 
     if role not in {"admin", "employee"}:
         return _json_error("Invalid role. Use 'admin' or 'employee'.", 400)
@@ -95,6 +114,8 @@ def create_user():
     user = User(
         business_id=business_id,
         email=email,
+        first_name=first_name[:80],
+        last_name=(last_name[:80] if last_name else None),
         encrypted_password=generate_password_hash(password),
         role=role,
         is_active=bool(is_active),
@@ -102,8 +123,13 @@ def create_user():
     db.session.add(user)
     db.session.flush()  # generate user.id
 
+    display = user_full_name(user) or email.split("@")[0]
     # Restriction: always exists an Employee for each User (admin or employee).
-    employee = Employee(user_id=user.id, business_id=business_id)
+    employee = Employee(
+        user_id=user.id,
+        business_id=business_id,
+        display_name=display[:120],
+    )
     db.session.add(employee)
     db.session.commit()
 
@@ -175,6 +201,16 @@ def update_user(user_id):
             return _json_error("User already exists for this email.", 409)
         user.email = email
 
+    if "first_name" in user_payload:
+        fn = (user_payload.get("first_name") or "").strip()
+        if not fn:
+            return _json_error("Invalid 'user.first_name'.", 400)
+        user.first_name = fn[:80]
+
+    if "last_name" in user_payload:
+        ln = (user_payload.get("last_name") or "").strip()
+        user.last_name = ln[:80] if ln else None
+
     if "password" in user_payload:
         password = user_payload.get("password")
         if not password:
@@ -199,9 +235,12 @@ def update_user(user_id):
         return _json_error("User must have a business_id.", 400)
     if user.employee is None:
         db.session.add(Employee(user_id=user.id, business_id=user.business_id))
+        db.session.flush()
     else:
         # For consistency, keep the employee bound to the same business as the user.
         user.employee.business_id = user.business_id
+
+    _sync_employee_display_name(user)
 
     db.session.commit()
     return jsonify(_user_employee_to_dict(user)), 200

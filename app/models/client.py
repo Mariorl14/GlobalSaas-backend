@@ -21,6 +21,9 @@ class Client(db.Model):
     last_name = db.Column(db.String(80), nullable=False)
     phone = db.Column(db.String(20), nullable=False)
     email = db.Column(db.String(120), nullable=True)
+    # Optional customer portal login (unique per business when set).
+    username = db.Column(db.String(80), nullable=True)
+    encrypted_password = db.Column(db.String(255), nullable=True)
     address = db.Column(db.String(255), nullable=True)
     notes = db.Column(db.Text, nullable=True)
     preferred_employee_id = db.Column(

@@ -214,10 +214,12 @@ def _empty_insights_payload(
     for i, e in enumerate(employees):
         if not e.is_active:
             continue
+        from app.name_utils import staff_display_label
+
         staff_rows.append(
             {
                 "employee_id": str(e.id),
-                "display_name": e.display_name or "Staff",
+                "display_name": staff_display_label(e),
                 "revenue": 0.0,
                 "appointments_completed": 0,
                 "appointments_total": 0,
@@ -401,7 +403,9 @@ def build_insights(
     name_map = {s.id: s.name for s in services}
 
     employees = Employee.query.filter_by(business_id=business_id).all()
-    emp_name = {e.id: (e.display_name or "Staff") for e in employees}
+    from app.name_utils import staff_display_label
+
+    emp_name = {e.id: staff_display_label(e) for e in employees}
 
     products = InventoryProduct.query.filter_by(business_id=business_id).all()
 
@@ -936,7 +940,7 @@ def build_insights(
             staff_rows.append(
                 {
                     "employee_id": str(e.id),
-                    "display_name": e.display_name or "Staff",
+                    "display_name": staff_display_label(e),
                     "revenue": 0.0,
                     "appointments_completed": 0,
                     "appointments_total": 0,

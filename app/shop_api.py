@@ -1304,13 +1304,19 @@ def void_sale(ctx: ShopContext, sale_id: str):
 
 
 def _staff_row(emp: Employee) -> dict:
+    from app.name_utils import staff_display_label, user_full_name
+
     u = emp.user
     return {
         "employee_id": str(emp.id),
         "user_id": str(emp.user_id),
         "email": u.email if u else None,
+        "first_name": u.first_name if u else None,
+        "last_name": u.last_name if u else None,
+        "full_name": user_full_name(u) if u else None,
         "role": u.role if u else None,
         "display_name": emp.display_name,
+        "label": staff_display_label(emp, u),
         "phone": emp.phone,
         "is_active": emp.is_active,
     }

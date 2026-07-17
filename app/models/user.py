@@ -21,6 +21,8 @@ class User(db.Model):
         nullable=True,
     )
     email = db.Column(db.String(120), nullable=False)
+    first_name = db.Column(db.String(80), nullable=True)
+    last_name = db.Column(db.String(80), nullable=True)
     encrypted_password = db.Column(db.String(255), nullable=False)
     role = db.Column(db.String(20), nullable=False)  # admin | employee | superadmin
     is_active = db.Column(db.Boolean, nullable=False, default=True)

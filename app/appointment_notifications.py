@@ -49,15 +49,12 @@ def _email_enabled() -> bool:
 
 
 def _employee_display_name(appointment: Appointment) -> str:
+    from app.name_utils import staff_display_label
+
     emp = appointment.employee
     if emp is None:
         return "—"
-    if emp.display_name:
-        return emp.display_name.strip()
-    user = getattr(emp, "user", None)
-    if user and user.email:
-        return user.email.split("@")[0]
-    return "—"
+    return staff_display_label(emp)
 
 
 def _customer_first_name(appointment: Appointment) -> str:

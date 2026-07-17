@@ -13,11 +13,15 @@ from datetime import date, datetime, time, timedelta
 from typing import Any
 
 from flask import Blueprint, jsonify, request
+from flask_jwt_extended import create_access_token, verify_jwt_in_request
 from sqlalchemy import and_, func, text
+from werkzeug.security import check_password_hash, generate_password_hash
 
+from app.customer_auth import CUSTOMER_ROLE, get_customer_context
 from app.extensions import db
 from app.models import Appointment, Business, Client, Employee, ServiceType
 from app.appointment_notifications import notify_appointment_created
+from app.name_utils import staff_display_label
 
 public_booking = Blueprint("public_booking", __name__, url_prefix="/api/public")
 
@@ -309,7 +313,7 @@ def list_public_barbers(slug: str):
     items = []
     for e in emps:
         u = e.user
-        label = e.display_name or (u.email.split("@")[0] if u and u.email else "Staff")
+        label = staff_display_label(e, u)
         items.append(
             {
                 "employee_id": str(e.id),
@@ -510,6 +514,175 @@ def _find_or_create_client(
     return c
 
 
+def _client_to_public_dict(c: Client) -> dict:
+    return {
+        "id": str(c.id),
+        "first_name": c.first_name,
+        "last_name": c.last_name,
+        "phone": c.phone,
+        "email": c.email,
+        "username": c.username,
+        "has_account": bool(c.username and c.encrypted_password),
+    }
+
+
+def _optional_logged_in_client(business_id: uuid.UUID) -> Client | None:
+    """If Authorization Bearer is a valid customer JWT for this business, return the Client."""
+    try:
+        verify_jwt_in_request(optional=True)
+        from flask_jwt_extended import get_jwt
+
+        claims = get_jwt()
+    except Exception:
+        return None
+    if not claims or claims.get("role") != CUSTOMER_ROLE:
+        return None
+    ctx, err = get_customer_context()
+    if err is not None or ctx is None:
+        return None
+    if ctx.business_id != business_id:
+        return None
+    return Client.query.filter_by(id=ctx.client_id, business_id=business_id).first()
+
+
+@public_booking.route("/booking/<slug>/auth/register", methods=["POST"])
+def customer_register(slug: str):
+    """Create a customer account (username + password) for returning bookings."""
+    b = _get_business_by_slug(slug)
+    if not b or not b.is_active:
+        return _json_error("Barbería no encontrada.", 404)
+
+    payload = request.get_json(silent=True) or {}
+    username = (payload.get("username") or "").strip().lower()
+    password = payload.get("password") or ""
+    first = (payload.get("first_name") or "").strip()
+    last = (payload.get("last_name") or "").strip()
+    phone = (payload.get("phone") or "").strip()
+    email = (payload.get("email") or "").strip() or None
+
+    if not username or len(username) < 3:
+        return _json_error("El usuario debe tener al menos 3 caracteres.", 400)
+    if not password or len(password) < 6:
+        return _json_error("La contraseña debe tener al menos 6 caracteres.", 400)
+    if not all([first, last, phone]):
+        return _json_error("Faltan nombre, apellido o teléfono.", 400)
+
+    cust_err = _validate_public_customer_fields(first, last, phone, email, None)
+    if cust_err:
+        return _json_error(cust_err, 400)
+
+    existing_user = Client.query.filter(
+        and_(
+            Client.business_id == b.id,
+            func.lower(Client.username) == username,
+        )
+    ).first()
+    if existing_user:
+        return _json_error("Ese nombre de usuario ya está en uso.", 409)
+
+    # Reuse existing client by phone when possible; otherwise create new.
+    client = Client.query.filter(
+        and_(Client.business_id == b.id, Client.phone == phone)
+    ).first()
+    if client:
+        if client.username and client.encrypted_password:
+            return _json_error(
+                "Ya hay una cuenta con este teléfono. Inicia sesión.", 409
+            )
+        client.first_name = first[:80]
+        client.last_name = last[:80]
+        if email:
+            client.email = email[:120]
+        client.username = username[:80]
+        client.encrypted_password = generate_password_hash(password)
+    else:
+        client = Client(
+            business_id=b.id,
+            first_name=first[:80],
+            last_name=last[:80],
+            phone=phone[:20],
+            email=(email or "")[:120] or None,
+            username=username[:80],
+            encrypted_password=generate_password_hash(password),
+            appointments_amount=0,
+        )
+        db.session.add(client)
+
+    db.session.commit()
+
+    token = create_access_token(
+        identity=str(client.id),
+        additional_claims={
+            "role": CUSTOMER_ROLE,
+            "client_id": str(client.id),
+            "business_id": str(b.id),
+        },
+    )
+    return (
+        jsonify({"access_token": token, "client": _client_to_public_dict(client)}),
+        201,
+    )
+
+
+@public_booking.route("/booking/<slug>/auth/signin", methods=["POST"])
+def customer_signin(slug: str):
+    b = _get_business_by_slug(slug)
+    if not b or not b.is_active:
+        return _json_error("Barbería no encontrada.", 404)
+
+    payload = request.get_json(silent=True) or {}
+    username = (payload.get("username") or "").strip().lower()
+    password = payload.get("password") or ""
+    if not username or not password:
+        return _json_error("Usuario y contraseña requeridos.", 400)
+
+    client = Client.query.filter(
+        and_(
+            Client.business_id == b.id,
+            func.lower(Client.username) == username,
+        )
+    ).first()
+    if (
+        not client
+        or not client.encrypted_password
+        or not check_password_hash(client.encrypted_password, password)
+    ):
+        return _json_error("Usuario o contraseña incorrectos.", 401)
+
+    token = create_access_token(
+        identity=str(client.id),
+        additional_claims={
+            "role": CUSTOMER_ROLE,
+            "client_id": str(client.id),
+            "business_id": str(b.id),
+        },
+    )
+    return jsonify({"access_token": token, "client": _client_to_public_dict(client)}), 200
+
+
+@public_booking.route("/booking/<slug>/auth/me", methods=["GET"])
+def customer_me(slug: str):
+    b = _get_business_by_slug(slug)
+    if not b or not b.is_active:
+        return _json_error("Barbería no encontrada.", 404)
+
+    try:
+        verify_jwt_in_request()
+    except Exception:
+        return _json_error("No autenticado.", 401)
+
+    ctx, err = get_customer_context()
+    if err is not None or ctx is None:
+        return err[0], err[1]  # type: ignore[index]
+    if ctx.business_id != b.id:
+        return _json_error("Token no válido para esta barbería.", 403)
+
+    client = Client.query.filter_by(id=ctx.client_id, business_id=b.id).first()
+    if not client:
+        return _json_error("Cliente no encontrado.", 404)
+    return jsonify({"client": _client_to_public_dict(client)}), 200
+
+
 @public_booking.route("/booking/<slug>/bookings", methods=["POST"])
 def create_public_booking(slug: str):
     b = _get_business_by_slug(slug)
@@ -520,10 +693,19 @@ def create_public_booking(slug: str):
     sid = _parse_uuid(payload.get("service_id"))
     start_raw = _parse_dt(payload.get("start_time"))
     end_raw = _parse_dt(payload.get("end_time"))
+
+    logged_client = _optional_logged_in_client(b.id)
+
     first = (payload.get("first_name") or "").strip()
     last = (payload.get("last_name") or "").strip()
     phone = (payload.get("phone") or "").strip()
     email = (payload.get("email") or "").strip() or None
+    if logged_client:
+        first = first or (logged_client.first_name or "")
+        last = last or (logged_client.last_name or "")
+        phone = phone or (logged_client.phone or "")
+        email = email or logged_client.email
+
     notes_raw = payload.get("notes")
     if notes_raw is None:
         notes: str | None = None
@@ -594,7 +776,19 @@ def create_public_booking(slug: str):
             409,
         )
 
-    client = _find_or_create_client(b.id, first, last, phone, email, notes)
+    if logged_client:
+        client = logged_client
+        # Keep profile fresh from form when they edit while logged in.
+        client.first_name = first[:80]
+        client.last_name = last[:80]
+        client.phone = phone[:20]
+        if email:
+            client.email = email[:120]
+        if notes:
+            client.notes = (client.notes or "") + ("\n" if client.notes else "") + notes
+    else:
+        client = _find_or_create_client(b.id, first, last, phone, email, notes)
+
     full_name = f"{first} {last}"[:120]
     appt = Appointment(
         client_id=client.id,
@@ -602,7 +796,7 @@ def create_public_booking(slug: str):
         business_id=b.id,
         employee_id=chosen.id,
         client_name=full_name,
-        client_email=(email or "")[:120] or "—",
+        client_email=(email or client.email or "")[:120] or "—",
         client_phone=phone[:20],
         start_time=start,
         end_time=end,
