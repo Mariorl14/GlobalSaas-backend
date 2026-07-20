@@ -26,6 +26,9 @@ class Employee(db.Model):
     display_name = db.Column(db.String(120), nullable=True)
     phone = db.Column(db.String(20), nullable=True)
     is_active = db.Column(db.Boolean, nullable=False, default=True)
+    # Optional weekly schedule (same JSON shape as business.business_hours_json).
+    # NULL / blank = follow the business hours for every day.
+    work_hours_json = db.Column(db.Text, nullable=True)
 
     user = db.relationship("User", back_populates="employee")
     business = db.relationship("Business", back_populates="employees")

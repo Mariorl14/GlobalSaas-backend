@@ -152,21 +152,56 @@ def _default_day_intervals(weekday: int) -> list[tuple[time, time]]:
 
 
 def _intervals_from_json(raw: str | None, weekday: int) -> list[tuple[time, time]]:
-    if not raw:
+    """
+    Resolve open intervals for a weekday (0=Mon … 6=Sun) for the business.
+
+    - Missing / blank / invalid JSON → built-in defaults.
+    - Valid JSON object → that schedule is authoritative:
+      missing day or empty list means closed (no fallback to defaults).
+    """
+    if not raw or not str(raw).strip():
         return _default_day_intervals(weekday)
     try:
         data = json.loads(raw)
     except json.JSONDecodeError:
         return _default_day_intervals(weekday)
 
-    labels = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
-    day_blocks = None
-    if isinstance(data, dict):
-        day_blocks = data.get(str(weekday))
-        if day_blocks is None:
-            day_blocks = data.get(labels[weekday])
-    if not isinstance(day_blocks, list) or len(day_blocks) == 0:
+    if not isinstance(data, dict):
         return _default_day_intervals(weekday)
+
+    return _day_blocks_to_intervals(data, weekday)
+
+
+def _employee_schedule_intervals(
+    raw: str | None, weekday: int
+) -> list[tuple[time, time]] | None:
+    """
+    Employee custom schedule for a weekday.
+
+    Returns None when the employee has no custom schedule (follow business hours).
+    Returns [] when the employee is explicitly closed that day.
+    """
+    if not raw or not str(raw).strip():
+        return None
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    return _day_blocks_to_intervals(data, weekday)
+
+
+def _day_blocks_to_intervals(data: dict, weekday: int) -> list[tuple[time, time]]:
+    labels = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+    day_blocks = data.get(str(weekday))
+    if day_blocks is None:
+        day_blocks = data.get(labels[weekday])
+
+    if day_blocks is None:
+        return []
+    if not isinstance(day_blocks, list) or len(day_blocks) == 0:
+        return []
 
     out: list[tuple[time, time]] = []
     for block in day_blocks:
@@ -176,7 +211,30 @@ def _intervals_from_json(raw: str | None, weekday: int) -> list[tuple[time, time
         c = _parse_hhmm(str(block.get("close", "")))
         if o and c and c > o:
             out.append((o, c))
-    return out if out else _default_day_intervals(weekday)
+    return out
+
+
+def _intersect_time_intervals(
+    a: list[tuple[time, time]], b: list[tuple[time, time]]
+) -> list[tuple[time, time]]:
+    out: list[tuple[time, time]] = []
+    for ao, ac in a:
+        for bo, bc in b:
+            start = max(ao, bo)
+            end = min(ac, bc)
+            if end > start:
+                out.append((start, end))
+    return out
+
+
+def _open_intervals_for_employee(
+    business: Business, employee: Employee, weekday: int
+) -> list[tuple[time, time]]:
+    biz = _intervals_from_json(business.business_hours_json, weekday)
+    emp = _employee_schedule_intervals(employee.work_hours_json, weekday)
+    if emp is None:
+        return biz
+    return _intersect_time_intervals(biz, emp)
 
 
 def _day_window_local(d: date) -> tuple[datetime, datetime]:
@@ -215,10 +273,16 @@ def _iter_slots_for_employee(
     d: date,
     duration_min: int,
 ) -> list[tuple[datetime, datetime]]:
+    emp = Employee.query.filter_by(
+        id=employee_id, business_id=business.id, is_active=True
+    ).first()
+    if not emp:
+        return []
+
     wd = d.weekday()
-    intervals = _intervals_from_json(business.business_hours_json, wd)
+    intervals = _open_intervals_for_employee(business, emp, wd)
     day_start, day_end = _day_window_local(d)
-    busy = _busy_intervals(business.id, employee_id, day_start, day_end)
+    busy = _busy_intervals(business.id, emp.id, day_start, day_end)
     step = timedelta(minutes=SLOT_STEP_MINUTES)
     duration = timedelta(minutes=duration_min)
     slots: list[tuple[datetime, datetime]] = []
@@ -461,23 +525,25 @@ def calendar_hints(slug: str):
 def _pick_employee_for_slot(
     business: Business, start: datetime, end: datetime, preferred: uuid.UUID | None
 ) -> Employee | None:
+    """Pick an active employee who is free AND working during this slot."""
+    duration_min = max(1, int((end - start).total_seconds() // 60))
     employees = (
         Employee.query.filter_by(business_id=business.id, is_active=True)
         .order_by(Employee.id)
         .all()
     )
-    day_start, day_end = _day_window_local(start.date())
+
+    def _ok(emp: Employee) -> bool:
+        return _slot_is_bookable(business, emp.id, start, end, duration_min)
+
     if preferred:
         emp = Employee.query.filter_by(
             id=preferred, business_id=business.id, is_active=True
         ).first()
-        if emp:
-            busy = _busy_intervals(business.id, emp.id, day_start, day_end)
-            if not _overlaps(start, end, busy):
-                return emp
+        if emp and _ok(emp):
+            return emp
     for emp in employees:
-        busy = _busy_intervals(business.id, emp.id, day_start, day_end)
-        if not _overlaps(start, end, busy):
+        if _ok(emp):
             return emp
     return None
 

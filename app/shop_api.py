@@ -5,6 +5,7 @@ Data is scoped to JWT claim business_id. Roles: admin (shop admin), employee (st
 
 from __future__ import annotations
 
+import json
 import uuid
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
@@ -46,6 +47,74 @@ shop_api = Blueprint("shop_api", __name__, url_prefix="/api/shop")
 APPOINTMENT_STATUSES = frozenset(
     {"scheduled", "confirmed", "completed", "canceled", "cancelled", "no_show", "pending"}
 )
+
+DAY_LABELS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+
+
+def _normalize_business_hours_json(raw) -> tuple[str | None, str | None]:
+    """
+    Validate and normalize business hours JSON.
+    Returns (normalized_json_or_none, error_message_or_none).
+    """
+    if raw is None:
+        return None, None
+    if isinstance(raw, (dict, list)):
+        data = raw
+    else:
+        text = str(raw).strip()
+        if not text:
+            return None, None
+        try:
+            data = json.loads(text)
+        except (TypeError, json.JSONDecodeError):
+            return None, "Horarios inválidos: JSON mal formado."
+
+    if not isinstance(data, dict):
+        return None, "Horarios inválidos: se espera un objeto por día."
+
+    allowed = set(DAY_LABELS) | {str(i) for i in range(7)}
+    normalized: dict[str, list[dict[str, str]]] = {}
+
+    for key, blocks in data.items():
+        key_s = str(key).strip().lower()
+        if key_s not in allowed:
+            return None, f"Horarios inválidos: día desconocido '{key}'."
+        if blocks is None:
+            continue
+        if not isinstance(blocks, list):
+            return None, f"Horarios inválidos: '{key_s}' debe ser una lista."
+        day_out: list[dict[str, str]] = []
+        for block in blocks:
+            if not isinstance(block, dict):
+                return None, f"Horarios inválidos en '{key_s}'."
+            open_s = str(block.get("open") or "").strip()
+            close_s = str(block.get("close") or "").strip()
+            if not open_s or not close_s:
+                return None, f"Horarios inválidos en '{key_s}': falta open/close."
+            if len(open_s) >= 5:
+                open_s = open_s[:5]
+            if len(close_s) >= 5:
+                close_s = close_s[:5]
+            try:
+                oh, om = [int(x) for x in open_s.split(":")]
+                ch, cm = [int(x) for x in close_s.split(":")]
+                if not (0 <= oh <= 23 and 0 <= om <= 59 and 0 <= ch <= 23 and 0 <= cm <= 59):
+                    raise ValueError
+            except ValueError:
+                return None, f"Horarios inválidos en '{key_s}': usa formato HH:MM."
+            if (ch, cm) <= (oh, om):
+                return None, (
+                    f"Horarios inválidos en '{key_s}': "
+                    "el cierre debe ser después de la apertura."
+                )
+            day_out.append({"open": f"{oh:02d}:{om:02d}", "close": f"{ch:02d}:{cm:02d}"})
+        label = key_s if key_s in DAY_LABELS else DAY_LABELS[int(key_s)]
+        normalized[label] = day_out
+
+    for label in DAY_LABELS:
+        normalized.setdefault(label, [])
+
+    return json.dumps(normalized, ensure_ascii=False), None
 
 
 def _json_error(message: str, status_code: int = 400):
@@ -1319,6 +1388,10 @@ def _staff_row(emp: Employee) -> dict:
         "label": staff_display_label(emp, u),
         "phone": emp.phone,
         "is_active": emp.is_active,
+        "work_hours_json": emp.work_hours_json,
+        "follows_business_hours": not bool(
+            emp.work_hours_json and str(emp.work_hours_json).strip()
+        ),
     }
 
 
@@ -1350,6 +1423,16 @@ def update_staff(ctx: ShopContext, employee_id: str):
         emp.phone = (payload.get("phone") or "").strip() or None
     if "is_active" in payload:
         emp.is_active = bool(payload.get("is_active"))
+    if "work_hours_json" in payload:
+        raw = payload.get("work_hours_json")
+        # null / empty = follow business hours
+        if raw is None or (isinstance(raw, str) and not raw.strip()):
+            emp.work_hours_json = None
+        else:
+            normalized, hours_err = _normalize_business_hours_json(raw)
+            if hours_err:
+                return _json_error(hours_err, 400)
+            emp.work_hours_json = normalized
 
     db.session.commit()
     return jsonify(_staff_row(emp)), 200
@@ -1398,7 +1481,12 @@ def update_settings(ctx: ShopContext):
     if "logo_url" in payload:
         b.logo_url = (payload.get("logo_url") or "").strip() or None
     if "business_hours_json" in payload:
-        b.business_hours_json = payload.get("business_hours_json")
+        normalized, hours_err = _normalize_business_hours_json(
+            payload.get("business_hours_json")
+        )
+        if hours_err:
+            return _json_error(hours_err, 400)
+        b.business_hours_json = normalized
     if "booking_notes" in payload:
         b.booking_notes = payload.get("booking_notes")
     if "is_active" in payload:
