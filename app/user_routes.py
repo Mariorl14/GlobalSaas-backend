@@ -67,13 +67,10 @@ def _user_employee_to_dict(user: User):
 @user_routes.route("/api/users", methods=["POST"])
 def create_user():
     """
-    Crea un User + su Employee asociado (flujo principal del producto).
+    Crea un User.
 
-    Payload esperado:
-    {
-      "user": { "email": "...", "password": "...", "is_active": true? },
-      "employee": { "business_id": "..." }
-    }
+    - admin / employee: requiere business_id y crea Employee asociado.
+    - superadmin: sin negocio ni Employee (acceso al panel global).
     """
     payload = request.get_json(silent=True) or {}
     user_payload = payload.get("user") if isinstance(payload.get("user"), dict) else payload
@@ -91,10 +88,26 @@ def create_user():
     if not first_name:
         return _json_error("Missing required field: user.first_name", 400)
 
-    if role not in {"admin", "employee"}:
-        return _json_error("Invalid role. Use 'admin' or 'employee'.", 400)
+    if role not in {"admin", "employee", "superadmin"}:
+        return _json_error("Invalid role. Use 'admin', 'employee' or 'superadmin'.", 400)
+
+    existing_by_email = User.query.filter_by(email=email).first()
+    if existing_by_email:
+        return _json_error("User already exists for this email.", 409)
+
     if role == "superadmin":
-        return _json_error("This endpoint does not support superadmin.", 400)
+        user = User(
+            business_id=None,
+            email=email,
+            first_name=first_name[:80],
+            last_name=(last_name[:80] if last_name else None),
+            encrypted_password=generate_password_hash(password),
+            role="superadmin",
+            is_active=bool(is_active),
+        )
+        db.session.add(user)
+        db.session.commit()
+        return jsonify(_user_employee_to_dict(user)), 201
 
     # Admin & Employee always belong to a business.
     business_id = _parse_uuid(
@@ -106,10 +119,6 @@ def create_user():
     business = Business.query.get(business_id)
     if not business:
         return _json_error("Business not found for provided 'business_id'.", 404)
-
-    existing_by_email = User.query.filter_by(email=email).first()
-    if existing_by_email:
-        return _json_error("User already exists for this email.", 409)
 
     user = User(
         business_id=business_id,
@@ -124,7 +133,6 @@ def create_user():
     db.session.flush()  # generate user.id
 
     display = user_full_name(user) or email.split("@")[0]
-    # Restriction: always exists an Employee for each User (admin or employee).
     employee = Employee(
         user_id=user.id,
         business_id=business_id,
@@ -186,10 +194,8 @@ def update_user(user_id):
 
     if requested_role is not None:
         requested_role = str(requested_role).strip()
-        if requested_role not in {"admin", "employee"}:
-            return _json_error("Invalid role. Use 'admin' or 'employee'.", 400)
-        if requested_role == "superadmin":
-            return _json_error("This endpoint does not support superadmin.", 400)
+        if requested_role not in {"admin", "employee", "superadmin"}:
+            return _json_error("Invalid role. Use 'admin', 'employee' or 'superadmin'.", 400)
 
     # User updates
     if "email" in user_payload:
@@ -220,24 +226,41 @@ def update_user(user_id):
     if "is_active" in user_payload:
         user.is_active = bool(user_payload.get("is_active"))
 
-    # Restriction: we don't allow changing business_id when updating.
+    new_role = requested_role if requested_role is not None else user.role
+
+    # Promote to superadmin: drop tenant binding.
+    if new_role == "superadmin":
+        if isinstance(user_payload, dict) and "business_id" in user_payload:
+            return _json_error("Superadmin cannot have a business_id.", 400)
+        if isinstance(employee_payload, dict) and "business_id" in employee_payload:
+            return _json_error("Superadmin cannot have an employee business_id.", 400)
+        if user.employee is not None:
+            db.session.delete(user.employee)
+            db.session.flush()
+        user.business_id = None
+        user.role = "superadmin"
+        db.session.commit()
+        return jsonify(_user_employee_to_dict(user)), 200
+
+    # Shop roles need a business.
     if isinstance(user_payload, dict) and "business_id" in user_payload:
         return _json_error("Updating 'business_id' is not supported.", 400)
     if isinstance(employee_payload, dict) and "business_id" in employee_payload:
         return _json_error("Updating 'employee.business_id' is not supported.", 400)
 
-    # Role change / employee lifecycle
+    if user.business_id is None:
+        return _json_error(
+            "Cannot assign shop role without a business. Create a new shop user instead.",
+            400,
+        )
+
     if requested_role is not None and requested_role != user.role:
         user.role = requested_role
 
-    # Restriction: always exists an Employee for each User, regardless of the role.
-    if user.business_id is None:
-        return _json_error("User must have a business_id.", 400)
     if user.employee is None:
         db.session.add(Employee(user_id=user.id, business_id=user.business_id))
         db.session.flush()
     else:
-        # For consistency, keep the employee bound to the same business as the user.
         user.employee.business_id = user.business_id
 
     _sync_employee_display_name(user)
