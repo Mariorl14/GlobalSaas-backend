@@ -53,8 +53,11 @@ class Config:
     # Fallback ISO 3166-1 alpha-2 when business.country_code is unset.
     DEFAULT_PHONE_COUNTRY_CODE = (os.getenv("DEFAULT_PHONE_COUNTRY_CODE") or "").strip().upper()
 
-    # Email appointment confirmations (SMTP)
+    # Email appointment confirmations
+    # Prefer RESEND_API_KEY on Render free tier (SMTP ports 25/465/587 are blocked).
+    # Local / paid hosts can keep using Gmail SMTP without Resend.
     EMAIL_NOTIFICATIONS_ENABLED = _env_bool("EMAIL_NOTIFICATIONS_ENABLED", False)
+    RESEND_API_KEY = os.getenv("RESEND_API_KEY")
     MAIL_SERVER = os.getenv("MAIL_SERVER")
     MAIL_PORT = int(os.getenv("MAIL_PORT", "587"))
     MAIL_USE_TLS = _env_bool("MAIL_USE_TLS", True)

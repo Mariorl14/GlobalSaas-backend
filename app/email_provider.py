@@ -1,11 +1,19 @@
-"""SMTP email provider for appointment confirmations."""
+"""Email provider for appointment confirmations.
+
+Uses Resend HTTPS API when RESEND_API_KEY is set (required on Render free tier,
+which blocks outbound SMTP ports 25/465/587). Falls back to SMTP otherwise
+(Gmail app password works fine locally / on paid hosts).
+"""
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import smtplib
 import ssl
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from email.message import EmailMessage
 
@@ -13,9 +21,11 @@ from flask import current_app
 
 logger = logging.getLogger(__name__)
 
-PROVIDER_NAME = "smtp"
+PROVIDER_SMTP = "smtp"
+PROVIDER_RESEND = "resend"
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 _MAX_ERROR_LEN = 500
+_RESEND_URL = "https://api.resend.com/emails"
 
 
 @dataclass(frozen=True)
@@ -42,13 +52,34 @@ def is_valid_email(value: str | None) -> bool:
     return bool(text) and text != "—" and len(text) <= 254 and bool(_EMAIL_RE.match(text))
 
 
+def _resend_api_key() -> str | None:
+    key = (current_app.config.get("RESEND_API_KEY") or "").strip()
+    return key or None
+
+
+def get_provider_name() -> str:
+    return PROVIDER_RESEND if _resend_api_key() else PROVIDER_SMTP
+
+
+# Back-compat for imports that expect PROVIDER_NAME
+PROVIDER_NAME = PROVIDER_SMTP
+
+
 def email_configured() -> bool:
     cfg = current_app.config
-    return bool(
-        cfg.get("MAIL_SERVER")
-        and cfg.get("MAIL_DEFAULT_SENDER")
-        and cfg.get("MAIL_PORT")
-    )
+    sender = cfg.get("MAIL_DEFAULT_SENDER")
+    if not sender:
+        return False
+    if _resend_api_key():
+        return True
+    return bool(cfg.get("MAIL_SERVER") and cfg.get("MAIL_PORT"))
+
+
+def _from_header() -> str:
+    cfg = current_app.config
+    sender = cfg["MAIL_DEFAULT_SENDER"]
+    sender_name = (cfg.get("MAIL_DEFAULT_SENDER_NAME") or "").strip()
+    return f"{sender_name} <{sender}>" if sender_name else sender
 
 
 def build_appointment_confirmation_email(
@@ -125,31 +156,80 @@ def build_appointment_confirmation_email(
     return subject, text_body, html_body
 
 
-def send_email(
+def _send_via_resend(
     *,
     to_email: str,
     subject: str,
     text_body: str,
-    html_body: str | None = None,
+    html_body: str | None,
 ) -> EmailSendResult:
-    """Send an email via SMTP. Never raises."""
-    if not email_configured():
+    api_key = _resend_api_key()
+    if not api_key:
         return EmailSendResult(
             ok=False,
             error_code="not_configured",
-            error_message="Email SMTP is not configured.",
-        )
-    if not is_valid_email(to_email):
-        return EmailSendResult(
-            ok=False,
-            error_code="invalid_email",
-            error_message="Recipient email is invalid.",
+            error_message="RESEND_API_KEY is not set.",
         )
 
     cfg = current_app.config
-    sender = cfg["MAIL_DEFAULT_SENDER"]
-    sender_name = (cfg.get("MAIL_DEFAULT_SENDER_NAME") or "").strip()
-    from_header = f"{sender_name} <{sender}>" if sender_name else sender
+    timeout = int(cfg.get("MAIL_TIMEOUT", 15))
+    payload: dict = {
+        "from": _from_header(),
+        "to": [to_email.strip()],
+        "subject": subject,
+        "text": text_body,
+    }
+    if html_body:
+        payload["html"] = html_body
+
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        _RESEND_URL,
+        data=data,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "User-Agent": "BarberSuite/1.0",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = json.loads(resp.read().decode("utf-8") or "{}")
+            return EmailSendResult(ok=True, message_id=body.get("id"))
+    except urllib.error.HTTPError as exc:
+        raw = ""
+        try:
+            raw = exc.read().decode("utf-8", errors="replace")
+        except Exception:
+            pass
+        logger.warning(
+            "Resend API failed",
+            extra={"status": exc.code, "error": raw[:300]},
+        )
+        return EmailSendResult(
+            ok=False,
+            error_code="resend_http",
+            error_message=_sanitize_error_message(f"HTTP {exc.code}: {raw}"),
+        )
+    except Exception as exc:
+        logger.exception("Unexpected Resend send error")
+        return EmailSendResult(
+            ok=False,
+            error_code="provider_error",
+            error_message=_sanitize_error_message(str(exc)),
+        )
+
+
+def _send_via_smtp(
+    *,
+    to_email: str,
+    subject: str,
+    text_body: str,
+    html_body: str | None,
+) -> EmailSendResult:
+    cfg = current_app.config
+    from_header = _from_header()
 
     msg = EmailMessage()
     msg["Subject"] = subject
@@ -206,3 +286,39 @@ def send_email(
             error_code="provider_error",
             error_message=_sanitize_error_message(str(exc)),
         )
+
+
+def send_email(
+    *,
+    to_email: str,
+    subject: str,
+    text_body: str,
+    html_body: str | None = None,
+) -> EmailSendResult:
+    """Send an email via Resend (HTTPS) or SMTP. Never raises."""
+    if not email_configured():
+        return EmailSendResult(
+            ok=False,
+            error_code="not_configured",
+            error_message="Email is not configured (set RESEND_API_KEY or SMTP).",
+        )
+    if not is_valid_email(to_email):
+        return EmailSendResult(
+            ok=False,
+            error_code="invalid_email",
+            error_message="Recipient email is invalid.",
+        )
+
+    if _resend_api_key():
+        return _send_via_resend(
+            to_email=to_email,
+            subject=subject,
+            text_body=text_body,
+            html_body=html_body,
+        )
+    return _send_via_smtp(
+        to_email=to_email,
+        subject=subject,
+        text_body=text_body,
+        html_body=html_body,
+    )

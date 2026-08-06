@@ -13,9 +13,9 @@ from flask import current_app
 from sqlalchemy.exc import IntegrityError
 
 from app.email_provider import (
-    PROVIDER_NAME as EMAIL_PROVIDER_NAME,
     build_appointment_confirmation_email,
     email_configured,
+    get_provider_name,
     is_valid_email,
     send_email,
 )
@@ -225,7 +225,7 @@ def send_appointment_email_confirmation(appointment: Appointment) -> dict[str, A
         log, should_send = _get_or_create_log(
             appointment,
             channel=CHANNEL_EMAIL,
-            provider=EMAIL_PROVIDER_NAME,
+            provider=get_provider_name(),
         )
         if log is None:
             return {"status": "failed"}
