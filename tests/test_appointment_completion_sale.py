@@ -57,7 +57,7 @@ def test_complete_appointment_creates_sale_once(app, client):
 
         res = client.put(
             f"/api/shop/appointments/{appt_id}",
-            json={"status": "completed"},
+            json={"status": "completed", "payment_method": "cash"},
             headers=headers,
         )
         assert res.status_code == 200
@@ -80,7 +80,7 @@ def test_complete_appointment_creates_sale_once(app, client):
         # Mark completed again — still a single sale
         res2 = client.put(
             f"/api/shop/appointments/{appt_id}",
-            json={"status": "completed"},
+            json={"status": "completed", "payment_method": "sinpe"},
             headers=headers,
         )
         assert res2.status_code == 200
@@ -128,7 +128,7 @@ def test_customers_served_counts_completion_sale_on_today(app, client):
 
         res = client.put(
             f"/api/shop/appointments/{appt.id}",
-            json={"status": "completed"},
+            json={"status": "completed", "payment_method": "card"},
             headers=headers,
         )
         assert res.status_code == 200

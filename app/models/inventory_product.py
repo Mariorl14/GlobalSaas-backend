@@ -19,7 +19,10 @@ class InventoryProduct(db.Model):
     )
     name = db.Column(db.String(120), nullable=False)
     category = db.Column(db.String(120), nullable=True)
-    price = db.Column(db.Numeric(10, 2), nullable=False)
+    # RETAIL_PRODUCT | OPERATING_SUPPLY | UNCLASSIFIED
+    item_kind = db.Column(db.String(32), nullable=False, default="UNCLASSIFIED")
+    # Sale price — required when selling retail; optional/null for supplies.
+    price = db.Column(db.Numeric(10, 2), nullable=True)
     unit_cost = db.Column(db.Numeric(10, 2), nullable=True)
     supplier = db.Column(db.String(200), nullable=True)
     stock = db.Column(db.Integer, nullable=False, default=0)

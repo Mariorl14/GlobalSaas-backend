@@ -50,6 +50,7 @@ def test_business_stats_endpoint(app, client):
         product = InventoryProduct(
             business_id=bid,
             name="Gel",
+            item_kind="RETAIL_PRODUCT",
             price=1000,
             unit_cost=400,
             stock=20,
@@ -64,6 +65,7 @@ def test_business_stats_endpoint(app, client):
             created_by_user_id=admin.id,
             client_id=bundle["client"].id,
             employee_id=bundle["employee"].id,
+            payment_method="cash",
             items=[
                 {
                     "item_type": "product",

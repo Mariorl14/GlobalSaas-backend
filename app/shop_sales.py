@@ -20,6 +20,19 @@ from app.models.sale import (
     SaleItem,
 )
 
+
+def require_payment_method(payment_method: Any) -> str:
+    """Validate and normalize payment method for new revenue transactions."""
+    if payment_method is None or str(payment_method).strip() == "":
+        raise SaleError("El método de pago es obligatorio.", 400)
+    method = str(payment_method).strip().lower()
+    if method not in PAYMENT_METHODS:
+        raise SaleError(
+            "Método de pago inválido. Use: cash, sinpe, card.",
+            400,
+        )
+    return method
+
 # Idempotency prefix: one POS ticket per completed appointment.
 APPOINTMENT_SALE_KEY_PREFIX = "appointment:"
 
@@ -123,7 +136,7 @@ def create_sale(
     customer_name: str | None = None,
     discount: Any = 0,
     tax: Any = 0,
-    payment_method: str = "cash",
+    payment_method: str | None = None,
     notes: str | None = None,
     idempotency_key: str | None = None,
 ) -> tuple[Sale, bool]:
@@ -138,11 +151,7 @@ def create_sale(
     if not items:
         raise SaleError("Agrega al menos un servicio o producto.")
 
-    method = (payment_method or "cash").strip().lower()
-    if method not in PAYMENT_METHODS:
-        raise SaleError(
-            f"payment_method inválido. Use: {', '.join(sorted(PAYMENT_METHODS))}"
-        )
+    method = require_payment_method(payment_method)
 
     disc = _money(discount)
     tax_amt = _money(tax)
@@ -216,6 +225,17 @@ def create_sale(
             ).first()
             if not product:
                 raise SaleError("Producto no encontrado.")
+            from app.inventory_kinds import is_sellable_kind
+
+            if not is_sellable_kind(getattr(product, "item_kind", None)):
+                raise SaleError(
+                    f"'{product.name}' no es un producto de venta. "
+                    "Clasifícalo como RETAIL_PRODUCT o quítalo del ticket."
+                )
+            if product.price is None and raw.get("unit_price") in (None, ""):
+                raise SaleError(
+                    f"'{product.name}' no tiene precio de venta configurado."
+                )
             unit = (
                 _money(raw.get("unit_price"), default=None)
                 if raw.get("unit_price") not in (None, "")
@@ -325,13 +345,14 @@ def ensure_sale_for_completed_appointment(
     appointment: Appointment,
     *,
     created_by_user_id: UUID | None,
-    payment_method: str = "cash",
+    payment_method: str | None,
 ) -> tuple[Sale, bool]:
     """
     Register service revenue for a completed appointment exactly once.
 
     Uses idempotency_key ``appointment:<id>`` so re-marking Completada
     (or concurrent requests) does not create a second ticket.
+    Requires payment_method (cash|sinpe|card) when creating a new sale.
     """
     key = appointment_sale_idempotency_key(appointment.id)
     existing = Sale.query.filter_by(
@@ -339,6 +360,8 @@ def ensure_sale_for_completed_appointment(
     ).first()
     if existing:
         return existing, True
+
+    method = require_payment_method(payment_method)
 
     client_id = appointment.client_id
     if client_id is not None:
@@ -358,7 +381,7 @@ def ensure_sale_for_completed_appointment(
         client_id=client_id,
         employee_id=appointment.employee_id,
         customer_name=(appointment.client_name or "").strip() or None,
-        payment_method=payment_method,
+        payment_method=method,
         notes=notes,
         idempotency_key=key,
         items=[
@@ -423,7 +446,7 @@ def link_orphan_inventory_sales(business_id: UUID) -> int:
             discount=Decimal("0"),
             tax=Decimal("0"),
             total=line,
-            payment_method="other",
+            payment_method=None,  # historical / unknown — do not invent Cash
             status="completed",
             notes=m.notes or "Venta desde inventario",
             created_by_user_id=m.created_by_user_id,

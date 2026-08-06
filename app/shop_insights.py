@@ -28,6 +28,13 @@ from app.models import (
 from app.models.inventory_movement import InventoryMovement
 from app.models.sale import Sale, SaleItem
 from app.shop_sales import appointment_sale_idempotency_key, is_appointment_sale_key
+from app.inventory_kinds import (
+    ITEM_KIND_RETAIL,
+    ITEM_KIND_SUPPLY,
+    ITEM_KIND_UNCLASSIFIED,
+    counts_toward_potential_sales,
+    is_operating_supply,
+)
 
 COMPLETED = "completed"
 NON_REVENUE = frozenset({"canceled", "cancelled", "no_show"})
@@ -51,6 +58,77 @@ def _pct(part: float, whole: float) -> float | None:
     if whole <= 0:
         return None
     return round((part / whole) * 100, 1)
+
+
+def _inventory_shelf_values(products: list[InventoryProduct]) -> dict[str, Any]:
+    """Split shelf cost/potential by item_kind. Potential sales = retail only."""
+    active = [p for p in products if p.is_active]
+    retail_cost = 0.0
+    retail_potential = 0.0
+    supply_cost = 0.0
+    unclassified_cost = 0.0
+    total_cost = 0.0
+    remaining_units = 0
+    low_stock: list[dict] = []
+    out_of_stock: list[dict] = []
+
+    for p in active:
+        stock = int(p.stock or 0)
+        remaining_units += stock
+        cost = _money(p.unit_cost) if p.unit_cost is not None else 0.0
+        line_cost = stock * cost
+        total_cost += line_cost
+        kind = getattr(p, "item_kind", None) or ITEM_KIND_UNCLASSIFIED
+        if counts_toward_potential_sales(kind):
+            price = _money(p.price) if p.price is not None else 0.0
+            retail_potential += stock * price
+            retail_cost += line_cost
+        elif is_operating_supply(kind):
+            supply_cost += line_cost
+        else:
+            unclassified_cost += line_cost
+
+        if stock <= 0:
+            out_of_stock.append(
+                {"id": str(p.id), "name": p.name, "stock": stock, "min_stock": p.min_stock}
+            )
+        elif stock <= int(p.min_stock or 0):
+            low_stock.append(
+                {"id": str(p.id), "name": p.name, "stock": stock, "min_stock": p.min_stock}
+            )
+
+    return {
+        "active": active,
+        "inventory_cost": round(total_cost, 2),
+        "retail_inventory_cost": round(retail_cost, 2),
+        "supplies_inventory_cost": round(supply_cost, 2),
+        "unclassified_inventory_cost": round(unclassified_cost, 2),
+        "potential_revenue": round(retail_potential, 2),
+        "projected_gross_profit": round(retail_potential - retail_cost, 2),
+        "remaining_units": remaining_units,
+        "sku_count": len(active),
+        "low_stock": low_stock,
+        "out_of_stock": out_of_stock,
+    }
+
+
+def _supply_purchase_expense(
+    business_id: UUID,
+    start: datetime,
+    end: datetime,
+    product_ids: set,
+) -> float:
+    """Sum purchase/restock costs for operating supplies in the period."""
+    if not product_ids:
+        return 0.0
+    rows = InventoryMovement.query.filter(
+        InventoryMovement.business_id == business_id,
+        InventoryMovement.product_id.in_(product_ids),
+        InventoryMovement.movement_type.in_(("purchase", "restock")),
+        InventoryMovement.created_at >= start,
+        InventoryMovement.created_at < end,
+    ).all()
+    return round(sum(float(m.total_cost or 0) for m in rows), 2)
 
 
 def _delta_pct(current: float, previous: float) -> float | None:
@@ -162,6 +240,49 @@ def _appt_price(appt: Appointment, price_map: dict[UUID, float]) -> float:
     return price_map.get(appt.service_type_id, 0.0)
 
 
+def _empty_payment_method_bucket() -> dict:
+    return {
+        "revenue": 0.0,
+        "count": 0,
+        "service_revenue": 0.0,
+        "product_revenue": 0.0,
+    }
+
+
+def _payment_methods_report(period_sales: list[Sale]) -> dict:
+    """
+    Completed sale totals grouped by payment method.
+
+    Unclassified = null payment_method or legacy values (transfer/other).
+    Uses sale.total (net ticket). Line-item splits ignore header discount allocation.
+    """
+    buckets = {
+        "cash": _empty_payment_method_bucket(),
+        "sinpe": _empty_payment_method_bucket(),
+        "card": _empty_payment_method_bucket(),
+        "unclassified": _empty_payment_method_bucket(),
+    }
+    for sale in period_sales:
+        raw = (sale.payment_method or "").strip().lower()
+        key = raw if raw in {"cash", "sinpe", "card"} else "unclassified"
+        buckets[key]["revenue"] += float(sale.total or 0)
+        buckets[key]["count"] += 1
+        for item in sale.items or []:
+            amt = float(item.line_total or 0)
+            if item.item_type == "service":
+                buckets[key]["service_revenue"] += amt
+            elif item.item_type == "product":
+                buckets[key]["product_revenue"] += amt
+    for key, bucket in buckets.items():
+        buckets[key] = {
+            "revenue": round(bucket["revenue"], 2),
+            "count": int(bucket["count"]),
+            "service_revenue": round(bucket["service_revenue"], 2),
+            "product_revenue": round(bucket["product_revenue"], 2),
+        }
+    return buckets
+
+
 def _empty_insights_payload(
     *,
     start: datetime,
@@ -173,27 +294,11 @@ def _empty_insights_payload(
     products: list[InventoryProduct],
 ) -> dict:
     """Lightweight response for brand-new shops (no appts/clients/sales yet)."""
-    active_products = [p for p in products if p.is_active]
-    cost_value = 0.0
-    retail_value = 0.0
-    low_stock: list[dict] = []
-    out_of_stock: list[dict] = []
-    for p in active_products:
-        stock = int(p.stock or 0)
-        price = _money(p.price)
-        cost = _money(p.unit_cost) if p.unit_cost is not None else 0.0
-        retail_value += stock * price
-        cost_value += stock * cost
-        if stock <= 0:
-            out_of_stock.append(
-                {"id": str(p.id), "name": p.name, "stock": stock, "min_stock": p.min_stock}
-            )
-        elif stock <= int(p.min_stock or 0):
-            low_stock.append(
-                {"id": str(p.id), "name": p.name, "stock": stock, "min_stock": p.min_stock}
-            )
-
-    remaining_units = sum(int(p.stock or 0) for p in active_products)
+    shelf = _inventory_shelf_values(products)
+    active_products = shelf["active"]
+    remaining_units = shelf["remaining_units"]
+    low_stock = shelf["low_stock"]
+    out_of_stock = shelf["out_of_stock"]
     day_count = max(1, (end - start).days)
     series = []
     cursor = start
@@ -267,7 +372,7 @@ def _empty_insights_payload(
                 "Ingresos netos = servicios (POS + citas sin ticket) + productos "
                 "− descuentos + impuestos."
             ),
-            "unavailable": ["tips", "reviews", "actual_payments"],
+            "unavailable": ["tips", "reviews"],
             "generated_at": now.isoformat() + "Z",
         },
         "snapshot": {
@@ -290,6 +395,7 @@ def _empty_insights_payload(
             "occupancy_rate": None,
             "occupancy_delta_pct": None,
         },
+        "payment_methods": _payment_methods_report([]),
         "series": series or [
             {
                 "date": start.strftime("%Y-%m-%d"),
@@ -339,14 +445,19 @@ def _empty_insights_payload(
             "average_customer_value": 0.0,
         },
         "inventory": {
-            "inventory_cost": round(cost_value, 2),
-            "potential_revenue": round(retail_value, 2),
-            "projected_gross_profit": round(retail_value - cost_value, 2),
+            "inventory_cost": shelf["inventory_cost"],
+            "retail_inventory_cost": shelf["retail_inventory_cost"],
+            "supplies_inventory_cost": shelf["supplies_inventory_cost"],
+            "unclassified_inventory_cost": shelf["unclassified_inventory_cost"],
+            "potential_revenue": shelf["potential_revenue"],
+            "projected_gross_profit": shelf["projected_gross_profit"],
             "products_remaining": remaining_units,
             "sku_count": len(active_products),
             "products_sold": 0,
             "product_revenue": 0.0,
             "product_gross_profit": 0.0,
+            "product_cogs": 0.0,
+            "supply_purchase_expense": 0.0,
             "avg_product_sale_value": 0.0,
             "sell_through_rate": None,
             "best_selling_product": None,
@@ -354,7 +465,10 @@ def _empty_insights_payload(
             "projected_product_revenue_month": 0.0,
             "low_stock": low_stock,
             "out_of_stock": out_of_stock,
-            "note": "Valores de inventario basados en stock y precios actuales.",
+            "note": (
+                "Ingreso potencial = solo productos de venta (RETAIL). "
+                "Clasifica insumos para no inflar proyecciones."
+            ),
         },
         "projections": {
             "today": 0.0,
@@ -680,6 +794,8 @@ def build_insights(
 
     customers_served = unique_customers_served(period_appts, period_sales)
     prev_customers_served = unique_customers_served(prev_appts, prev_sales)
+
+    payment_methods = _payment_methods_report(period_sales)
 
     snapshot = {
         "revenue": combined_revenue,
@@ -1057,25 +1173,22 @@ def build_insights(
     }
 
     # Inventory analytics + product sales from movement ledger
-    active_products = [p for p in products if p.is_active]
-    cost_value = 0.0
-    retail_value = 0.0
-    low_stock = []
-    out_of_stock = []
-    for p in active_products:
-        stock = int(p.stock or 0)
-        price = _money(p.price)
-        cost = _money(p.unit_cost) if p.unit_cost is not None else 0.0
-        retail_value += stock * price
-        cost_value += stock * cost
-        if stock <= 0:
-            out_of_stock.append(
-                {"id": str(p.id), "name": p.name, "stock": stock, "min_stock": p.min_stock}
-            )
-        elif stock <= int(p.min_stock or 0):
-            low_stock.append(
-                {"id": str(p.id), "name": p.name, "stock": stock, "min_stock": p.min_stock}
-            )
+    shelf = _inventory_shelf_values(products)
+    active_products = shelf["active"]
+    cost_value = shelf["inventory_cost"]
+    retail_value = shelf["potential_revenue"]
+    low_stock = shelf["low_stock"]
+    out_of_stock = shelf["out_of_stock"]
+    remaining_units = shelf["remaining_units"]
+
+    supply_ids = {
+        p.id
+        for p in products
+        if is_operating_supply(getattr(p, "item_kind", None))
+    }
+    supply_purchase_expense = _supply_purchase_expense(
+        business_id, start, end, supply_ids
+    )
 
     sold_by_product: dict = defaultdict(lambda: {"units": 0, "revenue": 0.0, "name": ""})
     product_name_by_id = {p.id: p.name for p in products}
@@ -1132,15 +1245,19 @@ def build_insights(
     )
 
     inventory = {
-        "inventory_cost": round(cost_value, 2),
-        "potential_revenue": round(retail_value, 2),
-        "projected_gross_profit": round(retail_value - cost_value, 2),
+        "inventory_cost": cost_value,
+        "retail_inventory_cost": shelf["retail_inventory_cost"],
+        "supplies_inventory_cost": shelf["supplies_inventory_cost"],
+        "unclassified_inventory_cost": shelf["unclassified_inventory_cost"],
+        "potential_revenue": retail_value,
+        "projected_gross_profit": shelf["projected_gross_profit"],
         "products_remaining": remaining_units,
-        "sku_count": len(active_products),
+        "sku_count": shelf["sku_count"],
         "products_sold": product_units_sold,
         "product_revenue": product_revenue,
         "product_cogs": product_cogs,
         "product_gross_profit": product_gross_profit,
+        "supply_purchase_expense": supply_purchase_expense,
         "avg_product_sale_value": avg_product_sale,
         "sell_through_rate": sell_through,
         "low_stock": low_stock[:10],
@@ -1148,7 +1265,11 @@ def build_insights(
         "best_selling_product": best_selling,
         "slowest_selling_product": slowest_selling,
         "projected_product_revenue_month": 0.0,  # filled after days_in_month known
-        "note": "Ventas de producto = movimientos tipo sale. Valor en anaquel = stock × precio/costo.",
+        "note": (
+            "Ingreso potencial = solo RETAIL_PRODUCT. "
+            "Gasto de insumos = compras/reposiciones de OPERATING_SUPPLY en el periodo. "
+            "COGS = costo en ventas de producto."
+        ),
     }
 
     # Projections + goals use the same combined revenue definition as the snapshot KPI
@@ -1555,10 +1676,11 @@ def build_insights(
                 "Ingresos netos = servicios (POS + citas sin ticket) + productos "
                 "− descuentos + impuestos."
             ),
-            "unavailable": ["tips", "reviews", "actual_payments"],
+            "unavailable": ["tips", "reviews"],
             "generated_at": now.isoformat() + "Z",
         },
         "snapshot": snapshot,
+        "payment_methods": payment_methods,
         "series": series,
         "revenue_breakdown": revenue_breakdown,
         "top_services": top_services,

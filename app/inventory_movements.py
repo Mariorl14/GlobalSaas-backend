@@ -21,6 +21,7 @@ from app.models.inventory_movement import (
     MOVEMENT_TYPES,
     InventoryMovement,
 )
+from app.inventory_kinds import is_sellable_kind
 
 
 class InventoryMovementError(Exception):
@@ -123,6 +124,12 @@ def apply_stock_movement(
     if not product:
         raise InventoryMovementError("Producto no encontrado.", 404)
 
+    if mtype == "sale" and not is_sellable_kind(getattr(product, "item_kind", None)):
+        raise InventoryMovementError(
+            "Solo los productos de venta (RETAIL_PRODUCT) se pueden vender. "
+            "Los insumos operativos se reducen con uso interno u otro motivo."
+        )
+
     if appointment_id is not None:
         appt = Appointment.query.filter_by(
             id=appointment_id, business_id=business_id
@@ -154,6 +161,10 @@ def apply_stock_movement(
     sale_price = _money(unit_sale_price)
     if mtype == "sale":
         if sale_price is None:
+            if product.price is None:
+                raise InventoryMovementError(
+                    "El producto no tiene precio de venta. Configúralo antes de vender."
+                )
             sale_price = Decimal(str(product.price))
         if sale_price < 0:
             raise InventoryMovementError("unit_sale_price inválido.")

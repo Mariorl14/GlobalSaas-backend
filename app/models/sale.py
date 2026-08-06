@@ -19,7 +19,10 @@ from sqlalchemy.dialects.postgresql import UUID
 
 from app.extensions import db
 
-PAYMENT_METHODS = frozenset({"cash", "card", "sinpe", "transfer", "other"})
+# Canonical methods for new revenue transactions (lowercase storage).
+PAYMENT_METHODS = frozenset({"cash", "card", "sinpe"})
+# Legacy values that may exist on historical rows; not accepted on create.
+LEGACY_PAYMENT_METHODS = frozenset({"transfer", "other"})
 SALE_STATUSES = frozenset({"completed", "void"})
 ITEM_TYPES = frozenset({"service", "product"})
 
@@ -64,7 +67,9 @@ class Sale(db.Model):
     discount = db.Column(Numeric(12, 2), nullable=False, default=0)
     tax = db.Column(Numeric(12, 2), nullable=False, default=0)
     total = db.Column(Numeric(12, 2), nullable=False, default=0)
-    payment_method = db.Column(db.String(20), nullable=False, default="cash")
+    # Nullable so historical / backfilled tickets can be "not recorded".
+    # New sales must set cash|sinpe|card via API validation.
+    payment_method = db.Column(db.String(20), nullable=True)
     status = db.Column(db.String(20), nullable=False, default="completed")
     notes = db.Column(Text, nullable=True)
     created_by_user_id = db.Column(

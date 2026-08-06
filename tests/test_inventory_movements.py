@@ -32,6 +32,7 @@ def _make_product(business_id, *, stock=10, price=100, unit_cost=40, name="Cera"
         business_id=business_id,
         name=name,
         category="Styling",
+        item_kind="RETAIL_PRODUCT",
         price=price,
         unit_cost=unit_cost,
         stock=stock,
@@ -252,7 +253,11 @@ class TestInventoryMovements:
             headers = _auth_header(shop["admin"], shop["business"].id)
             res = client.post(
                 f"/api/shop/inventory/{p.id}/sale",
-                json={"quantity": 2, "idempotency_key": "api-sale-1"},
+                json={
+                    "quantity": 2,
+                    "payment_method": "cash",
+                    "idempotency_key": "api-sale-1",
+                },
                 headers=headers,
             )
             assert res.status_code == 201
@@ -262,7 +267,11 @@ class TestInventoryMovements:
             # replay
             res2 = client.post(
                 f"/api/shop/inventory/{p.id}/sale",
-                json={"quantity": 2, "idempotency_key": "api-sale-1"},
+                json={
+                    "quantity": 2,
+                    "payment_method": "cash",
+                    "idempotency_key": "api-sale-1",
+                },
                 headers=headers,
             )
             assert res2.status_code == 200

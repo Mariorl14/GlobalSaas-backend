@@ -41,6 +41,12 @@ from app.shop_sales import (
     sale_to_dict,
 )
 from app.models.sale import Sale
+from app.inventory_kinds import (
+    ITEM_KIND_RETAIL,
+    ITEM_KIND_UNCLASSIFIED,
+    ITEM_KINDS,
+    normalize_item_kind,
+)
 
 shop_api = Blueprint("shop_api", __name__, url_prefix="/api/shop")
 
@@ -212,12 +218,15 @@ def _service_to_dict(s: ServiceType) -> dict:
 
 
 def _inventory_to_dict(p: InventoryProduct) -> dict:
+    kind = getattr(p, "item_kind", None) or "UNCLASSIFIED"
     return {
         "id": str(p.id),
         "business_id": str(p.business_id),
         "name": p.name,
         "category": p.category,
-        "price": float(p.price),
+        "item_kind": kind,
+        "is_sellable": kind == "RETAIL_PRODUCT",
+        "price": float(p.price) if p.price is not None else None,
         "unit_cost": float(p.unit_cost) if p.unit_cost is not None else None,
         "supplier": p.supplier,
         "stock": p.stock,
@@ -517,7 +526,9 @@ def create_appointment(ctx: ShopContext):
     if status == "completed":
         try:
             ensure_sale_for_completed_appointment(
-                a, created_by_user_id=ctx.user_id
+                a,
+                created_by_user_id=ctx.user_id,
+                payment_method=payload.get("payment_method"),
             )
         except SaleError as exc:
             db.session.rollback()
@@ -600,7 +611,9 @@ def update_appointment(ctx: ShopContext, appointment_id: str):
     if becoming_completed:
         try:
             ensure_sale_for_completed_appointment(
-                a, created_by_user_id=ctx.user_id
+                a,
+                created_by_user_id=ctx.user_id,
+                payment_method=payload.get("payment_method"),
             )
         except SaleError as exc:
             db.session.rollback()
@@ -896,11 +909,14 @@ def delete_service(ctx: ShopContext, service_id: str):
 @shop_api.route("/inventory", methods=["GET"])
 @shop_jwt_required
 def list_inventory(ctx: ShopContext):
-    items = (
-        InventoryProduct.query.filter_by(business_id=ctx.business_id)
-        .order_by(InventoryProduct.name)
-        .all()
-    )
+    q = InventoryProduct.query.filter_by(business_id=ctx.business_id)
+    kind = normalize_item_kind(request.args.get("item_kind"))
+    if kind:
+        q = q.filter(InventoryProduct.item_kind == kind)
+    sellable = (request.args.get("sellable") or "").strip().lower()
+    if sellable in {"1", "true", "yes"}:
+        q = q.filter(InventoryProduct.item_kind == ITEM_KIND_RETAIL)
+    items = q.order_by(InventoryProduct.name).all()
     return jsonify({"items": [_inventory_to_dict(p) for p in items]}), 200
 
 
@@ -909,9 +925,28 @@ def list_inventory(ctx: ShopContext):
 def create_inventory(ctx: ShopContext):
     payload = request.get_json(silent=True) or {}
     name = (payload.get("name") or "").strip()
-    price = _parse_decimal(payload.get("price"))
-    if not name or price is None or price < 0:
-        return _json_error("name y price (>=0) son obligatorios.", 400)
+    if not name:
+        return _json_error("name es obligatorio.", 400)
+
+    kind = normalize_item_kind(payload.get("item_kind")) or ITEM_KIND_UNCLASSIFIED
+    if kind not in ITEM_KINDS:
+        return _json_error(
+            "item_kind inválido. Use RETAIL_PRODUCT, OPERATING_SUPPLY o UNCLASSIFIED.",
+            400,
+        )
+
+    if "price" in payload and payload.get("price") in (None, ""):
+        price = None
+    elif payload.get("price") not in (None, ""):
+        price = _parse_decimal(payload.get("price"))
+        if price is None or price < 0:
+            return _json_error("price inválido.", 400)
+    else:
+        price = None
+
+    if kind == ITEM_KIND_RETAIL and price is None:
+        return _json_error("Los productos de venta requieren precio (price >= 0).", 400)
+
     try:
         stock = int(payload.get("stock", 0))
         min_stock = int(payload.get("min_stock", 0))
@@ -926,6 +961,7 @@ def create_inventory(ctx: ShopContext):
         business_id=ctx.business_id,
         name=name,
         category=(payload.get("category") or "").strip() or None,
+        item_kind=kind,
         price=price,
         unit_cost=unit_cost,
         supplier=(payload.get("supplier") or "").strip() or None,
@@ -972,11 +1008,22 @@ def update_inventory(ctx: ShopContext, product_id: str):
         p.name = v
     if "category" in payload:
         p.category = (payload.get("category") or "").strip() or None
+    if "item_kind" in payload:
+        kind = normalize_item_kind(payload.get("item_kind"))
+        if not kind:
+            return _json_error(
+                "item_kind inválido. Use RETAIL_PRODUCT, OPERATING_SUPPLY o UNCLASSIFIED.",
+                400,
+            )
+        p.item_kind = kind
     if "price" in payload:
-        pr = _parse_decimal(payload.get("price"))
-        if pr is None or pr < 0:
-            return _json_error("price inválido.", 400)
-        p.price = pr
+        if payload.get("price") in (None, ""):
+            p.price = None
+        else:
+            pr = _parse_decimal(payload.get("price"))
+            if pr is None or pr < 0:
+                return _json_error("price inválido.", 400)
+            p.price = pr
     if "unit_cost" in payload:
         p.unit_cost = _parse_decimal(payload.get("unit_cost"))
     if "supplier" in payload:
@@ -1006,6 +1053,10 @@ def update_inventory(ctx: ShopContext, product_id: str):
             return _json_error("min_stock >= 0.", 400)
     if "is_active" in payload:
         p.is_active = bool(payload.get("is_active"))
+
+    effective_kind = p.item_kind or ITEM_KIND_UNCLASSIFIED
+    if effective_kind == ITEM_KIND_RETAIL and p.price is None:
+        return _json_error("Los productos de venta requieren precio (price >= 0).", 400)
 
     db.session.commit()
     return jsonify(_inventory_to_dict(p)), 200
@@ -1139,7 +1190,7 @@ def create_inventory_movement(ctx: ShopContext, product_id: str):
                 ],
                 client_id=_parse_uuid(payload.get("client_id")),
                 notes=payload.get("notes"),
-                payment_method=payload.get("payment_method") or "other",
+                payment_method=payload.get("payment_method"),
                 idempotency_key=payload.get("idempotency_key")
                 or request.headers.get("Idempotency-Key"),
             )
@@ -1233,7 +1284,7 @@ def register_inventory_sale(ctx: ShopContext, product_id: str):
             ],
             client_id=_parse_uuid(payload.get("client_id")),
             notes=payload.get("notes"),
-            payment_method=payload.get("payment_method") or "other",
+            payment_method=payload.get("payment_method"),
             idempotency_key=payload.get("idempotency_key")
             or request.headers.get("Idempotency-Key"),
         )
@@ -1297,7 +1348,9 @@ def list_sales(ctx: ShopContext):
         q = q.filter(Sale.client_id == cid)
 
     method = (request.args.get("payment_method") or "").strip().lower()
-    if method:
+    if method in {"unrecorded", "unknown", "null"}:
+        q = q.filter(Sale.payment_method.is_(None))
+    elif method:
         q = q.filter(Sale.payment_method == method)
 
     status = (request.args.get("status") or "").strip().lower()
@@ -1337,7 +1390,7 @@ def create_sale_endpoint(ctx: ShopContext):
             customer_name=payload.get("customer_name"),
             discount=payload.get("discount", 0),
             tax=payload.get("tax", 0),
-            payment_method=payload.get("payment_method") or "cash",
+            payment_method=payload.get("payment_method"),
             notes=payload.get("notes"),
             idempotency_key=payload.get("idempotency_key")
             or request.headers.get("Idempotency-Key"),

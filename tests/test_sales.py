@@ -39,6 +39,7 @@ def test_create_sale_reduces_stock_and_counts_revenue(app, client):
         product = InventoryProduct(
             business_id=bundle["business"].id,
             name="Pomada",
+            item_kind="RETAIL_PRODUCT",
             price=5000,
             unit_cost=2000,
             stock=10,
@@ -91,6 +92,7 @@ def test_create_sale_reduces_stock_and_counts_revenue(app, client):
         sale2, replayed2 = create_sale(
             business_id=bundle["business"].id,
             created_by_user_id=admin.id,
+            payment_method="sinpe",
             items=[
                 {
                     "item_type": "product",
@@ -130,6 +132,7 @@ def test_inventory_sale_appears_in_ventas(app, client):
         product = InventoryProduct(
             business_id=bundle["business"].id,
             name="Cera Test",
+            item_kind="RETAIL_PRODUCT",
             price=3000,
             unit_cost=1000,
             stock=20,
@@ -145,6 +148,7 @@ def test_inventory_sale_appears_in_ventas(app, client):
             json={
                 "quantity": 2,
                 "unit_sale_price": 3000,
+                "payment_method": "cash",
                 "idempotency_key": "inv-sale-1",
             },
             headers=headers,
@@ -174,6 +178,7 @@ def test_orphan_inventory_sale_backfills_into_ventas(app, client):
         product = InventoryProduct(
             business_id=bundle["business"].id,
             name="Wax",
+            item_kind="RETAIL_PRODUCT",
             price=2000,
             unit_cost=800,
             stock=10,
