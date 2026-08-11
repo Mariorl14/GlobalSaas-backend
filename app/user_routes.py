@@ -69,7 +69,7 @@ def create_user():
     """
     Crea un User.
 
-    - admin / employee: requiere business_id y crea Employee asociado.
+    - owner / admin / employee: requiere business_id y crea Employee asociado.
     - superadmin: sin negocio ni Employee (acceso al panel global).
     """
     payload = request.get_json(silent=True) or {}
@@ -88,8 +88,11 @@ def create_user():
     if not first_name:
         return _json_error("Missing required field: user.first_name", 400)
 
-    if role not in {"admin", "employee", "superadmin"}:
-        return _json_error("Invalid role. Use 'admin', 'employee' or 'superadmin'.", 400)
+    if role not in {"owner", "admin", "employee", "superadmin"}:
+        return _json_error(
+            "Invalid role. Use 'owner', 'admin', 'employee' or 'superadmin'.",
+            400,
+        )
 
     existing_by_email = User.query.filter_by(email=email).first()
     if existing_by_email:
@@ -194,8 +197,11 @@ def update_user(user_id):
 
     if requested_role is not None:
         requested_role = str(requested_role).strip()
-        if requested_role not in {"admin", "employee", "superadmin"}:
-            return _json_error("Invalid role. Use 'admin', 'employee' or 'superadmin'.", 400)
+        if requested_role not in {"owner", "admin", "employee", "superadmin"}:
+            return _json_error(
+                "Invalid role. Use 'owner', 'admin', 'employee' or 'superadmin'.",
+                400,
+            )
 
     # User updates
     if "email" in user_payload:

@@ -504,9 +504,15 @@ def build_insights(
     range_key: str = "today",
     from_dt: datetime | None = None,
     to_dt: datetime | None = None,
+    employee_id: UUID | None = None,
 ) -> dict:
+    """
+    When employee_id is set (staff portal), metrics are scoped to that barber:
+    their appointments and sales only. Shop-wide inventory is omitted.
+    """
     now = datetime.utcnow()
     start, end, prev_start, prev_end, label = resolve_period(range_key, from_dt, to_dt, now)
+    staff_scope = employee_id is not None
 
     business = Business.query.get(business_id)
     goals = parse_goals(getattr(business, "insights_goals_json", None) if business else None)
@@ -516,12 +522,19 @@ def build_insights(
     duration_map = {s.id: int(s.duration or 0) for s in services}
     name_map = {s.id: s.name for s in services}
 
-    employees = Employee.query.filter_by(business_id=business_id).all()
+    employees_q = Employee.query.filter_by(business_id=business_id)
+    if staff_scope:
+        employees_q = employees_q.filter(Employee.id == employee_id)
+    employees = employees_q.all()
     from app.name_utils import staff_display_label
 
     emp_name = {e.id: staff_display_label(e) for e in employees}
 
-    products = InventoryProduct.query.filter_by(business_id=business_id).all()
+    products = (
+        []
+        if staff_scope
+        else InventoryProduct.query.filter_by(business_id=business_id).all()
+    )
 
     # Brand-new shops: skip the heavy analytics path (many POS/sale queries).
     has_appointment = (
@@ -563,27 +576,25 @@ def build_insights(
 
     # Pull a wide window once (prev period / month / hist → future for projections)
     horizon_end = max(end, now + timedelta(days=31))
-    appts = (
-        Appointment.query.filter(
-            Appointment.business_id == business_id,
-            Appointment.start_time >= load_from,
-            Appointment.start_time < horizon_end,
-        )
-        .all()
+    appt_q = Appointment.query.filter(
+        Appointment.business_id == business_id,
+        Appointment.start_time >= load_from,
+        Appointment.start_time < horizon_end,
     )
+    if staff_scope:
+        appt_q = appt_q.filter(Appointment.employee_id == employee_id)
+    appts = appt_q.all()
 
     # Also need older appts for inactivity / loyalty / first visit heuristics
-    all_client_appts = (
-        db.session.query(
-            Appointment.client_id,
-            func.min(Appointment.start_time).label("first_visit"),
-            func.max(Appointment.start_time).label("last_visit"),
-            func.count(Appointment.id).label("visit_count"),
-        )
-        .filter(Appointment.business_id == business_id)
-        .group_by(Appointment.client_id)
-        .all()
-    )
+    client_appt_q = db.session.query(
+        Appointment.client_id,
+        func.min(Appointment.start_time).label("first_visit"),
+        func.max(Appointment.start_time).label("last_visit"),
+        func.count(Appointment.id).label("visit_count"),
+    ).filter(Appointment.business_id == business_id)
+    if staff_scope:
+        client_appt_q = client_appt_q.filter(Appointment.employee_id == employee_id)
+    all_client_appts = client_appt_q.group_by(Appointment.client_id).all()
     client_stats = {
         row.client_id: {
             "first_visit": row.first_visit,
@@ -600,13 +611,16 @@ def build_insights(
     prev_appts = [a for a in appts if in_range(a, prev_start, prev_end)]
 
     # Appointments that already have a POS ticket (avoid double-counting service revenue)
+    sale_key_q = Sale.query.filter(
+        Sale.business_id == business_id,
+        Sale.status == "completed",
+        Sale.idempotency_key.like("appointment:%"),
+    )
+    if staff_scope:
+        sale_key_q = sale_key_q.filter(Sale.employee_id == employee_id)
     appt_sale_keys = {
         s.idempotency_key
-        for s in Sale.query.filter(
-            Sale.business_id == business_id,
-            Sale.status == "completed",
-            Sale.idempotency_key.like("appointment:%"),
-        ).all()
+        for s in sale_key_q.all()
         if is_appointment_sale_key(s.idempotency_key)
     }
 
@@ -659,19 +673,23 @@ def build_insights(
     cur = metrics_for(period_appts)
     prev = metrics_for(prev_appts)
 
-    # Product sales ledger (only movement_type = sale)
-    sale_movements = InventoryMovement.query.filter(
-        InventoryMovement.business_id == business_id,
-        InventoryMovement.movement_type == "sale",
-        InventoryMovement.created_at >= start,
-        InventoryMovement.created_at < end,
-    ).all()
-    prev_sale_movements = InventoryMovement.query.filter(
-        InventoryMovement.business_id == business_id,
-        InventoryMovement.movement_type == "sale",
-        InventoryMovement.created_at >= prev_start,
-        InventoryMovement.created_at < prev_end,
-    ).all()
+    # Product sales ledger — omitted for staff-scoped views
+    if staff_scope:
+        sale_movements = []
+        prev_sale_movements = []
+    else:
+        sale_movements = InventoryMovement.query.filter(
+            InventoryMovement.business_id == business_id,
+            InventoryMovement.movement_type == "sale",
+            InventoryMovement.created_at >= start,
+            InventoryMovement.created_at < end,
+        ).all()
+        prev_sale_movements = InventoryMovement.query.filter(
+            InventoryMovement.business_id == business_id,
+            InventoryMovement.movement_type == "sale",
+            InventoryMovement.created_at >= prev_start,
+            InventoryMovement.created_at < prev_end,
+        ).all()
     product_units_sold = sum(int(m.quantity or 0) for m in sale_movements)
     product_revenue = round(sum(float(m.total_revenue or 0) for m in sale_movements), 2)
     product_cogs = round(sum(float(m.total_cost or 0) for m in sale_movements), 2)
@@ -682,7 +700,7 @@ def build_insights(
     )
 
     # POS service lines (SaleItem) — avoids relying only on completed appointments
-    pos_service_rows = (
+    pos_svc_q = (
         db.session.query(SaleItem, Sale)
         .join(Sale, Sale.id == SaleItem.sale_id)
         .filter(
@@ -692,14 +710,16 @@ def build_insights(
             Sale.created_at >= start,
             Sale.created_at < end,
         )
-        .all()
     )
+    if staff_scope:
+        pos_svc_q = pos_svc_q.filter(Sale.employee_id == employee_id)
+    pos_service_rows = pos_svc_q.all()
     pos_service_revenue = round(
         sum(float(item.line_total or 0) for item, _ in pos_service_rows), 2
     )
     pos_services_sold = sum(int(item.quantity or 0) for item, _ in pos_service_rows)
 
-    prev_pos_service_rows = (
+    prev_pos_svc_q = (
         db.session.query(SaleItem)
         .join(Sale, Sale.id == SaleItem.sale_id)
         .filter(
@@ -709,23 +729,30 @@ def build_insights(
             Sale.created_at >= prev_start,
             Sale.created_at < prev_end,
         )
-        .all()
     )
+    if staff_scope:
+        prev_pos_svc_q = prev_pos_svc_q.filter(Sale.employee_id == employee_id)
+    prev_pos_service_rows = prev_pos_svc_q.all()
     prev_pos_service_revenue = sum(float(i.line_total or 0) for i in prev_pos_service_rows)
 
     # Sale headers for net cash (discounts / tax) and ticket counts
-    period_sales = Sale.query.filter(
+    period_sales_q = Sale.query.filter(
         Sale.business_id == business_id,
         Sale.status == "completed",
         Sale.created_at >= start,
         Sale.created_at < end,
-    ).all()
-    prev_sales = Sale.query.filter(
+    )
+    prev_sales_q = Sale.query.filter(
         Sale.business_id == business_id,
         Sale.status == "completed",
         Sale.created_at >= prev_start,
         Sale.created_at < prev_end,
-    ).all()
+    )
+    if staff_scope:
+        period_sales_q = period_sales_q.filter(Sale.employee_id == employee_id)
+        prev_sales_q = prev_sales_q.filter(Sale.employee_id == employee_id)
+    period_sales = period_sales_q.all()
+    prev_sales = prev_sales_q.all()
     period_discount = round(sum(float(s.discount or 0) for s in period_sales), 2)
     period_tax = round(sum(float(s.tax or 0) for s in period_sales), 2)
     prev_discount = round(sum(float(s.discount or 0) for s in prev_sales), 2)

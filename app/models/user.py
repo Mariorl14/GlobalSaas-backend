@@ -24,7 +24,7 @@ class User(db.Model):
     first_name = db.Column(db.String(80), nullable=True)
     last_name = db.Column(db.String(80), nullable=True)
     encrypted_password = db.Column(db.String(255), nullable=False)
-    role = db.Column(db.String(20), nullable=False)  # admin | employee | superadmin
+    role = db.Column(db.String(20), nullable=False)  # owner | admin | employee | superadmin
     is_active = db.Column(db.Boolean, nullable=False, default=True)
 
     business = db.relationship("Business", back_populates="users")

@@ -266,10 +266,18 @@ def _client_scope_ids(business_id: uuid.UUID):
 def _get_appointment_for_tenant(
     ctx: ShopContext, appointment_id: uuid.UUID
 ) -> Appointment | None:
-    return (
-        Appointment.query.filter_by(id=appointment_id, business_id=ctx.business_id)
-        .first()
-    )
+    q = Appointment.query.filter_by(id=appointment_id, business_id=ctx.business_id)
+    if ctx.is_staff:
+        if not ctx.employee_id:
+            return None
+        q = q.filter(Appointment.employee_id == ctx.employee_id)
+    return q.first()
+
+
+def _deny_staff_inventory(ctx: ShopContext):
+    if ctx.is_staff:
+        return _json_error("El personal no tiene acceso al inventario.", 403)
+    return None
 
 
 # --- Me & dashboard ---
@@ -388,12 +396,15 @@ def shop_insights(ctx: ShopContext):
     range_key = (request.args.get("range") or "today").strip().lower()
     from_dt = _parse_dt(request.args.get("from"))
     to_dt = _parse_dt(request.args.get("to"))
+    # Staff only see their own performance metrics.
+    scope_employee_id = ctx.employee_id if ctx.is_staff else None
     try:
         payload = build_insights(
             ctx.business_id,
             range_key=range_key,
             from_dt=from_dt,
             to_dt=to_dt,
+            employee_id=scope_employee_id,
         )
         return jsonify(payload), 200
     except Exception as exc:
@@ -419,8 +430,10 @@ def shop_insights_goals(ctx: ShopContext):
     if request.method == "GET":
         return jsonify({"goals": parse_goals(business.insights_goals_json)}), 200
 
-    if ctx.role != "admin":
-        return _json_error("Solo el administrador puede editar metas.", 403)
+    if not ctx.is_manager:
+        return _json_error(
+            "Solo el propietario o administrador puede editar metas.", 403
+        )
 
     payload = request.get_json(silent=True) or {}
     current = parse_goals(business.insights_goals_json)
@@ -450,9 +463,15 @@ def list_appointments(ctx: ShopContext):
     if dt:
         q = q.filter(Appointment.start_time <= dt)
 
-    emp = _parse_uuid(request.args.get("employee_id"))
-    if emp:
-        q = q.filter(Appointment.employee_id == emp)
+    # Staff may only see their own appointments (ignore client-supplied employee_id).
+    if ctx.is_staff:
+        if not ctx.employee_id:
+            return jsonify({"items": []}), 200
+        q = q.filter(Appointment.employee_id == ctx.employee_id)
+    else:
+        emp = _parse_uuid(request.args.get("employee_id"))
+        if emp:
+            q = q.filter(Appointment.employee_id == emp)
 
     st = request.args.get("status")
     if st:
@@ -483,6 +502,11 @@ def create_appointment(ctx: ShopContext):
     eid = _parse_uuid(payload.get("employee_id"))
     start = _parse_dt(payload.get("start_time"))
     end = _parse_dt(payload.get("end_time"))
+    # Staff can only book / assign appointments to themselves.
+    if ctx.is_staff:
+        if not ctx.employee_id:
+            return _json_error("Tu cuenta de staff no tiene empleado asociado.", 403)
+        eid = ctx.employee_id
     if not all([cid, sid, eid, start, end]):
         return _json_error(
             "Faltan client_id, service_type_id, employee_id, start_time, end_time.",
@@ -584,6 +608,8 @@ def update_appointment(ctx: ShopContext, appointment_id: str):
         eid = _parse_uuid(payload.get("employee_id"))
         if not eid:
             return _json_error("employee_id inválido.", 400)
+        if ctx.is_staff and eid != ctx.employee_id:
+            return _json_error("Solo puedes gestionar tus propias citas.", 403)
         emp = Employee.query.filter_by(id=eid, business_id=ctx.business_id).first()
         if not emp:
             return _json_error("Empleado no encontrado.", 404)
@@ -909,6 +935,9 @@ def delete_service(ctx: ShopContext, service_id: str):
 @shop_api.route("/inventory", methods=["GET"])
 @shop_jwt_required
 def list_inventory(ctx: ShopContext):
+    denied = _deny_staff_inventory(ctx)
+    if denied:
+        return denied
     q = InventoryProduct.query.filter_by(business_id=ctx.business_id)
     kind = normalize_item_kind(request.args.get("item_kind"))
     if kind:
@@ -923,6 +952,9 @@ def list_inventory(ctx: ShopContext):
 @shop_api.route("/inventory", methods=["POST"])
 @shop_jwt_required
 def create_inventory(ctx: ShopContext):
+    denied = _deny_staff_inventory(ctx)
+    if denied:
+        return denied
     payload = request.get_json(silent=True) or {}
     name = (payload.get("name") or "").strip()
     if not name:
@@ -993,6 +1025,9 @@ def create_inventory(ctx: ShopContext):
 @shop_api.route("/inventory/<product_id>", methods=["PUT"])
 @shop_jwt_required
 def update_inventory(ctx: ShopContext, product_id: str):
+    denied = _deny_staff_inventory(ctx)
+    if denied:
+        return denied
     pid = _parse_uuid(product_id)
     if not pid:
         return _json_error("ID inválido.", 400)
@@ -1065,6 +1100,9 @@ def update_inventory(ctx: ShopContext, product_id: str):
 @shop_api.route("/inventory/<product_id>", methods=["DELETE"])
 @shop_jwt_required
 def delete_inventory(ctx: ShopContext, product_id: str):
+    denied = _deny_staff_inventory(ctx)
+    if denied:
+        return denied
     pid = _parse_uuid(product_id)
     if not pid:
         return _json_error("ID inválido.", 400)
@@ -1079,6 +1117,9 @@ def delete_inventory(ctx: ShopContext, product_id: str):
 @shop_api.route("/inventory/movements", methods=["GET"])
 @shop_jwt_required
 def list_inventory_movements(ctx: ShopContext):
+    denied = _deny_staff_inventory(ctx)
+    if denied:
+        return denied
     q = InventoryMovement.query.filter_by(business_id=ctx.business_id)
 
     pid = _parse_uuid(request.args.get("product_id"))
@@ -1137,6 +1178,9 @@ def list_inventory_movements(ctx: ShopContext):
 @shop_api.route("/inventory/<product_id>/movements", methods=["GET"])
 @shop_jwt_required
 def list_product_movements(ctx: ShopContext, product_id: str):
+    denied = _deny_staff_inventory(ctx)
+    if denied:
+        return denied
     pid = _parse_uuid(product_id)
     if not pid:
         return _json_error("ID inválido.", 400)
@@ -1163,6 +1207,9 @@ def list_product_movements(ctx: ShopContext, product_id: str):
 @shop_api.route("/inventory/<product_id>/movements", methods=["POST"])
 @shop_jwt_required
 def create_inventory_movement(ctx: ShopContext, product_id: str):
+    denied = _deny_staff_inventory(ctx)
+    if denied:
+        return denied
     pid = _parse_uuid(product_id)
     if not pid:
         return _json_error("ID inválido.", 400)
@@ -1260,6 +1307,9 @@ def create_inventory_movement(ctx: ShopContext, product_id: str):
 @shop_api.route("/inventory/<product_id>/sale", methods=["POST"])
 @shop_jwt_required
 def register_inventory_sale(ctx: ShopContext, product_id: str):
+    denied = _deny_staff_inventory(ctx)
+    if denied:
+        return denied
     pid = _parse_uuid(product_id)
     if not pid:
         return _json_error("ID inválido.", 400)

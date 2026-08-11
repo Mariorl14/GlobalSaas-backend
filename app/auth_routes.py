@@ -153,7 +153,7 @@ def shop_signin():
         return _json_error("Missing required fields: email, password", 400)
 
     user = User.query.filter_by(email=email).first()
-    if not user or user.role not in ("admin", "employee"):
+    if not user or user.role not in ("admin", "owner", "employee"):
         return _json_error("Invalid credentials.", 401)
 
     if user.business_id is None:

@@ -9,9 +9,12 @@ from typing import Callable, NamedTuple, Optional, Tuple, TypeVar
 from flask import jsonify, request
 from flask_jwt_extended import get_jwt, get_jwt_identity, jwt_required
 
-# DB roles for tenant users (maps to product language: shop_admin, barber_staff)
-SHOP_ROLES = frozenset({"admin", "employee"})
-SHOP_ADMIN_ROLE = "admin"
+# Tenant portal roles
+SHOP_ROLES = frozenset({"admin", "owner", "employee"})
+# Full shop management (settings, staff, inventory, goals)
+SHOP_MANAGER_ROLES = frozenset({"admin", "owner"})
+SHOP_ADMIN_ROLE = "admin"  # legacy alias; prefer SHOP_MANAGER_ROLES
+SHOP_STAFF_ROLE = "employee"
 
 F = TypeVar("F", bound=Callable)
 
@@ -21,6 +24,14 @@ class ShopContext(NamedTuple):
     business_id: uuid.UUID
     role: str
     employee_id: Optional[uuid.UUID]
+
+    @property
+    def is_manager(self) -> bool:
+        return self.role in SHOP_MANAGER_ROLES
+
+    @property
+    def is_staff(self) -> bool:
+        return self.role == SHOP_STAFF_ROLE
 
 
 def get_shop_context() -> Tuple[Optional[ShopContext], Optional[Tuple]]:
@@ -72,6 +83,8 @@ def shop_jwt_required(fn: F) -> F:
 
 
 def shop_admin_required(fn: F) -> F:
+    """Owner or admin of the shop (full management)."""
+
     @wraps(fn)
     @jwt_required()
     def decorated(*args, **kwargs):
@@ -80,8 +93,20 @@ def shop_admin_required(fn: F) -> F:
         ctx, err = get_shop_context()
         if err is not None:
             return err[0], err[1]
-        if ctx.role != SHOP_ADMIN_ROLE:
-            return jsonify({"error": "Solo el administrador de la tienda puede hacer esto."}), 403
+        if not ctx.is_manager:
+            return (
+                jsonify(
+                    {
+                        "error": "Solo el propietario o administrador de la tienda puede hacer esto."
+                    }
+                ),
+                403,
+            )
         return fn(ctx, *args, **kwargs)
 
     return decorated  # type: ignore[return-value]
+
+
+def shop_manager_required(fn: F) -> F:
+    """Alias for shop_admin_required (owner + admin)."""
+    return shop_admin_required(fn)
