@@ -1,6 +1,8 @@
 """
 Multi-tenant shop (barber) API — all routes under /api/shop/*.
-Data is scoped to JWT claim business_id. Roles: admin (shop admin), employee (staff).
+Data is scoped to JWT claim business_id.
+Roles: owner/admin see the full shop; employee (staff) only their own
+appointments, sales, and insights.
 """
 
 from __future__ import annotations
@@ -11,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 
 from flask import Blueprint, jsonify, request
-from sqlalchemy import func, or_
+from sqlalchemy import false, func, or_
 
 from app.extensions import db
 from app.models import (
@@ -183,6 +185,7 @@ def _business_to_public(b: Business) -> dict:
         "phone": b.phone,
         "is_active": b.is_active,
         "logo_url": b.logo_url,
+        "public_slug": b.public_slug,
         "business_hours_json": b.business_hours_json,
         "booking_notes": b.booking_notes,
     }
@@ -274,6 +277,24 @@ def _get_appointment_for_tenant(
     return q.first()
 
 
+def _apply_staff_appointment_scope(q, ctx: ShopContext):
+    """Owners/admins see the whole shop; staff only their assigned appointments."""
+    if not ctx.is_staff:
+        return q
+    if not ctx.employee_id:
+        return q.filter(false())
+    return q.filter(Appointment.employee_id == ctx.employee_id)
+
+
+def _apply_staff_sale_scope(q, ctx: ShopContext):
+    """Owners/admins see all sales; staff only sales attributed to them."""
+    if not ctx.is_staff:
+        return q
+    if not ctx.employee_id:
+        return q.filter(false())
+    return q.filter(Sale.employee_id == ctx.employee_id)
+
+
 def _deny_staff_inventory(ctx: ShopContext):
     if ctx.is_staff:
         return _json_error("El personal no tiene acceso al inventario.", 403)
@@ -320,7 +341,10 @@ def shop_dashboard(ctx: ShopContext):
     week_end = day_start + timedelta(days=7)
     thirty_ago = now - timedelta(days=30)
 
-    appt_base = Appointment.query.filter(Appointment.business_id == bid)
+    appt_base = _apply_staff_appointment_scope(
+        Appointment.query.filter(Appointment.business_id == bid),
+        ctx,
+    )
 
     today_count = appt_base.filter(
         Appointment.start_time >= day_start,
@@ -339,20 +363,32 @@ def shop_dashboard(ctx: ShopContext):
         .all()
     )
 
-    active_customers = Client.query.filter(_client_scope_ids(bid)).count()
-
-    low_stock = (
-        InventoryProduct.query.filter(
-            InventoryProduct.business_id == bid,
-            InventoryProduct.is_active.is_(True),
-            InventoryProduct.stock <= InventoryProduct.min_stock,
+    # Staff: customers who booked with them. Owners/admins: whole shop.
+    if ctx.is_staff and ctx.employee_id:
+        active_customers = (
+            db.session.query(func.count(func.distinct(Appointment.client_id)))
+            .filter(
+                Appointment.business_id == bid,
+                Appointment.employee_id == ctx.employee_id,
+            )
+            .scalar()
+            or 0
         )
-        .order_by(InventoryProduct.stock.asc())
-        .limit(10)
-        .all()
-    )
+        low_stock = []
+    else:
+        active_customers = Client.query.filter(_client_scope_ids(bid)).count()
+        low_stock = (
+            InventoryProduct.query.filter(
+                InventoryProduct.business_id == bid,
+                InventoryProduct.is_active.is_(True),
+                InventoryProduct.stock <= InventoryProduct.min_stock,
+            )
+            .order_by(InventoryProduct.stock.asc())
+            .limit(10)
+            .all()
+        )
 
-    top_rows = (
+    top_q = (
         db.session.query(
             Appointment.service_type_id,
             ServiceType.name,
@@ -363,7 +399,11 @@ def shop_dashboard(ctx: ShopContext):
             Appointment.business_id == bid,
             Appointment.start_time >= thirty_ago,
         )
-        .group_by(Appointment.service_type_id, ServiceType.name)
+    )
+    if ctx.is_staff and ctx.employee_id:
+        top_q = top_q.filter(Appointment.employee_id == ctx.employee_id)
+    top_rows = (
+        top_q.group_by(Appointment.service_type_id, ServiceType.name)
         .order_by(func.count(Appointment.id).desc())
         .limit(5)
         .all()
@@ -383,6 +423,7 @@ def shop_dashboard(ctx: ShopContext):
                 "low_stock_items": [_inventory_to_dict(p) for p in low_stock],
                 "top_services": top_services,
                 "revenue_month_placeholder": None,
+                "scoped_to_employee": bool(ctx.is_staff),
             }
         ),
         200,
@@ -562,6 +603,7 @@ def create_appointment(ctx: ShopContext):
     payload = _appointment_to_dict(a)
     payload["notification_status"] = notification_result.get("status")
     payload["email_notification_status"] = notification_result.get("email")
+    payload["staff_email_notification_status"] = notification_result.get("staff_email")
     payload["whatsapp_notification_status"] = notification_result.get("whatsapp")
     return jsonify(payload), 201
 
@@ -1381,6 +1423,7 @@ def list_sales(ctx: ShopContext):
         db.session.commit()
 
     q = Sale.query.filter_by(business_id=ctx.business_id)
+    q = _apply_staff_sale_scope(q, ctx)
 
     df = _parse_dt(request.args.get("from"))
     dt = _parse_dt(request.args.get("to"))
@@ -1389,9 +1432,11 @@ def list_sales(ctx: ShopContext):
     if dt:
         q = q.filter(Sale.created_at <= dt)
 
-    emp = _parse_uuid(request.args.get("employee_id"))
-    if emp:
-        q = q.filter(Sale.employee_id == emp)
+    # Staff cannot override scope via query params.
+    if not ctx.is_staff:
+        emp = _parse_uuid(request.args.get("employee_id"))
+        if emp:
+            q = q.filter(Sale.employee_id == emp)
 
     cid = _parse_uuid(request.args.get("client_id"))
     if cid:
@@ -1417,7 +1462,9 @@ def get_sale(ctx: ShopContext, sale_id: str):
     sid = _parse_uuid(sale_id)
     if not sid:
         return _json_error("ID inválido.", 400)
-    sale = Sale.query.filter_by(id=sid, business_id=ctx.business_id).first()
+    q = Sale.query.filter_by(id=sid, business_id=ctx.business_id)
+    q = _apply_staff_sale_scope(q, ctx)
+    sale = q.first()
     if not sale:
         return _json_error("Venta no encontrada.", 404)
     return jsonify(sale_to_dict(sale)), 200
@@ -1430,13 +1477,18 @@ def create_sale_endpoint(ctx: ShopContext):
     items = payload.get("items")
     if not isinstance(items, list):
         return _json_error("items debe ser una lista.", 400)
+    sale_employee_id = _parse_uuid(payload.get("employee_id"))
+    if ctx.is_staff:
+        if not ctx.employee_id:
+            return _json_error("Tu cuenta de staff no tiene empleado asociado.", 403)
+        sale_employee_id = ctx.employee_id
     try:
         sale, replayed = create_sale(
             business_id=ctx.business_id,
             created_by_user_id=ctx.user_id,
             items=items,
             client_id=_parse_uuid(payload.get("client_id")),
-            employee_id=_parse_uuid(payload.get("employee_id")),
+            employee_id=sale_employee_id,
             customer_name=payload.get("customer_name"),
             discount=payload.get("discount", 0),
             tax=payload.get("tax", 0),
@@ -1462,7 +1514,9 @@ def void_sale(ctx: ShopContext, sale_id: str):
     sid = _parse_uuid(sale_id)
     if not sid:
         return _json_error("ID inválido.", 400)
-    sale = Sale.query.filter_by(id=sid, business_id=ctx.business_id).first()
+    q = Sale.query.filter_by(id=sid, business_id=ctx.business_id)
+    q = _apply_staff_sale_scope(q, ctx)
+    sale = q.first()
     if not sale:
         return _json_error("Venta no encontrada.", 404)
     if sale.status == "void":
@@ -1483,6 +1537,7 @@ def _staff_row(emp: Employee) -> dict:
         "employee_id": str(emp.id),
         "user_id": str(emp.user_id),
         "email": u.email if u else None,
+        "personal_email": u.personal_email if u else None,
         "first_name": u.first_name if u else None,
         "last_name": u.last_name if u else None,
         "full_name": user_full_name(u) if u else None,
@@ -1526,6 +1581,14 @@ def update_staff(ctx: ShopContext, employee_id: str):
         emp.phone = (payload.get("phone") or "").strip() or None
     if "is_active" in payload:
         emp.is_active = bool(payload.get("is_active"))
+    if "personal_email" in payload and emp.user is not None:
+        from app.email_provider import is_valid_email
+
+        raw = payload.get("personal_email")
+        text = (str(raw).strip() if raw is not None else "") or ""
+        if text and not is_valid_email(text):
+            return _json_error("Email personal inválido.", 400)
+        emp.user.personal_email = text[:120] if text else None
     if "work_hours_json" in payload:
         raw = payload.get("work_hours_json")
         # null / empty = follow business hours

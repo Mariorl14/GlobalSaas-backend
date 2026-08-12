@@ -883,6 +883,7 @@ def create_public_booking(slug: str):
                 "employee_id": str(chosen.id),
                 "notification_status": notification_result.get("status"),
                 "email_notification_status": notification_result.get("email"),
+                "staff_email_notification_status": notification_result.get("staff_email"),
                 "whatsapp_notification_status": notification_result.get("whatsapp"),
             }
         ),

@@ -30,8 +30,8 @@ def _uuid_to_str_or_none(value):
     return str(value) if value is not None else None
 
 
-def _json_user(user: User):
-    return {
+def _json_user(user: User, *, employee_id: str | None = None):
+    payload = {
         "id": str(user.id),
         "email": user.email,
         "first_name": user.first_name,
@@ -41,6 +41,9 @@ def _json_user(user: User):
         "business_id": _uuid_to_str_or_none(user.business_id),
         "is_active": user.is_active,
     }
+    if employee_id is not None:
+        payload["employee_id"] = employee_id
+    return payload
 
 
 @auth.route("/api/auth/signup", methods=["POST"])
@@ -181,7 +184,7 @@ def shop_signin():
         jsonify(
             {
                 "access_token": access_token,
-                "user": _json_user(user),
+                "user": _json_user(user, employee_id=employee_id_str),
             }
         ),
         200,

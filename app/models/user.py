@@ -21,6 +21,8 @@ class User(db.Model):
         nullable=True,
     )
     email = db.Column(db.String(120), nullable=False)
+    # Personal inbox for booking alerts (login stays on `email`).
+    personal_email = db.Column(db.String(120), nullable=True)
     first_name = db.Column(db.String(80), nullable=True)
     last_name = db.Column(db.String(80), nullable=True)
     encrypted_password = db.Column(db.String(255), nullable=False)

@@ -6,6 +6,7 @@ from werkzeug.security import generate_password_hash
 from app.extensions import db
 from app.models import Business, Employee, User
 from app.name_utils import staff_display_label, user_full_name
+from app.email_provider import is_valid_email
 
 
 user_routes = Blueprint("user_routes", __name__)
@@ -28,6 +29,18 @@ def _uuid_to_str_or_none(value):
     return str(value) if value is not None else None
 
 
+def _normalize_personal_email(raw) -> tuple[str | None, str | None]:
+    """Returns (email_or_none, error_message). Empty clears to None."""
+    if raw is None:
+        return None, None
+    text = str(raw).strip()
+    if not text:
+        return None, None
+    if not is_valid_email(text):
+        return None, "Invalid 'user.personal_email'."
+    return text[:120], None
+
+
 def _sync_employee_display_name(user: User) -> None:
     """Keep Employee.display_name aligned with user first/last name when set."""
     if user.employee is None:
@@ -43,6 +56,7 @@ def _user_employee_to_dict(user: User):
         "user": {
             "id": str(user.id),
             "email": user.email,
+            "personal_email": user.personal_email,
             "first_name": user.first_name,
             "last_name": user.last_name,
             "full_name": user_full_name(user),
@@ -80,6 +94,9 @@ def create_user():
     password = user_payload.get("password")
     first_name = (user_payload.get("first_name") or "").strip() or None
     last_name = (user_payload.get("last_name") or "").strip() or None
+    personal_email, personal_err = _normalize_personal_email(
+        user_payload.get("personal_email")
+    )
     is_active = user_payload.get("is_active", True)
     role = (user_payload.get("role") or payload.get("role") or "employee").strip()
 
@@ -87,10 +104,19 @@ def create_user():
         return _json_error("Missing required fields: user.email, user.password", 400)
     if not first_name:
         return _json_error("Missing required field: user.first_name", 400)
+    if personal_err:
+        return _json_error(personal_err, 400)
 
     if role not in {"owner", "admin", "employee", "superadmin"}:
         return _json_error(
             "Invalid role. Use 'owner', 'admin', 'employee' or 'superadmin'.",
+            400,
+        )
+
+    # Shop staff need a personal inbox for booking alerts.
+    if role in {"owner", "admin", "employee"} and not personal_email:
+        return _json_error(
+            "Missing required field: user.personal_email (used for booking alerts).",
             400,
         )
 
@@ -102,6 +128,7 @@ def create_user():
         user = User(
             business_id=None,
             email=email,
+            personal_email=personal_email,
             first_name=first_name[:80],
             last_name=(last_name[:80] if last_name else None),
             encrypted_password=generate_password_hash(password),
@@ -126,6 +153,7 @@ def create_user():
     user = User(
         business_id=business_id,
         email=email,
+        personal_email=personal_email,
         first_name=first_name[:80],
         last_name=(last_name[:80] if last_name else None),
         encrypted_password=generate_password_hash(password),
@@ -212,6 +240,14 @@ def update_user(user_id):
         if existing:
             return _json_error("User already exists for this email.", 409)
         user.email = email
+
+    if "personal_email" in user_payload:
+        personal_email, personal_err = _normalize_personal_email(
+            user_payload.get("personal_email")
+        )
+        if personal_err:
+            return _json_error(personal_err, 400)
+        user.personal_email = personal_email
 
     if "first_name" in user_payload:
         fn = (user_payload.get("first_name") or "").strip()

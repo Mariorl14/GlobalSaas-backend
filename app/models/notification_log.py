@@ -8,7 +8,12 @@ from app.extensions import db
 
 NOTIFICATION_CHANNELS = frozenset({"whatsapp", "sms", "email"})
 NOTIFICATION_TYPES = frozenset(
-    {"appointment_confirmation", "appointment_reminder", "appointment_cancellation"}
+    {
+        "appointment_confirmation",
+        "appointment_reminder",
+        "appointment_cancellation",
+        "appointment_staff_alert",
+    }
 )
 NOTIFICATION_STATUSES = frozenset(
     {"pending", "sent", "delivered", "read", "failed", "skipped"}

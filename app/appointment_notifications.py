@@ -1,5 +1,6 @@
 """
 Appointment confirmations — WhatsApp (optional) + email when customer email is present.
+Also emails the assigned staff member (user.email) when a booking is created.
 Call after the appointment transaction commits.
 """
 
@@ -14,6 +15,7 @@ from sqlalchemy.exc import IntegrityError
 
 from app.email_provider import (
     build_appointment_confirmation_email,
+    build_appointment_staff_alert_email,
     email_configured,
     get_provider_name,
     is_valid_email,
@@ -34,6 +36,7 @@ logger = logging.getLogger(__name__)
 CHANNEL_WHATSAPP = "whatsapp"
 CHANNEL_EMAIL = "email"
 TYPE_APPOINTMENT_CONFIRMATION = "appointment_confirmation"
+TYPE_APPOINTMENT_STAFF_ALERT = "appointment_staff_alert"
 _RECIPIENT_MAX = 255
 
 _TERMINAL_SKIP_STATUSES = frozenset({"sent", "delivered", "read", "skipped"})
@@ -55,6 +58,32 @@ def _employee_display_name(appointment: Appointment) -> str:
     if emp is None:
         return "—"
     return staff_display_label(emp)
+
+
+def _staff_first_name(appointment: Appointment) -> str:
+    emp = appointment.employee
+    if emp is None:
+        return "Equipo"
+    user = emp.user
+    if user and (user.first_name or "").strip():
+        return user.first_name.strip()
+    label = _employee_display_name(appointment)
+    if label and label != "—":
+        return label.split()[0]
+    return "Equipo"
+
+
+def _customer_full_name(appointment: Appointment) -> str:
+    name = (appointment.client_name or "").strip()
+    if name:
+        return name
+    client = appointment.client
+    if client:
+        parts = [client.first_name or "", client.last_name or ""]
+        joined = " ".join(p.strip() for p in parts if p and p.strip()).strip()
+        if joined:
+            return joined
+    return "Cliente"
 
 
 def _customer_first_name(appointment: Appointment) -> str:
@@ -102,10 +131,28 @@ def _resolve_customer_email(appointment: Appointment) -> str | None:
     return None
 
 
+def _resolve_staff_email(appointment: Appointment) -> str | None:
+    emp = appointment.employee
+    if emp is None:
+        return None
+    user = emp.user
+    if user is None:
+        return None
+    if user.is_active is False:
+        return None
+    # Prefer personal inbox for alerts; keep company email for login only.
+    for raw in (user.personal_email, user.email):
+        email = (raw or "").strip()
+        if is_valid_email(email):
+            return email
+    return None
+
+
 def _get_or_create_log(
     appointment: Appointment,
     *,
     channel: str,
+    notification_type: str = TYPE_APPOINTMENT_CONFIRMATION,
     provider: str | None = None,
 ) -> tuple[NotificationLog | None, bool]:
     """
@@ -116,7 +163,7 @@ def _get_or_create_log(
         NotificationLog.query.filter_by(
             appointment_id=appointment.id,
             channel=channel,
-            notification_type=TYPE_APPOINTMENT_CONFIRMATION,
+            notification_type=notification_type,
         ).first()
     )
     if existing:
@@ -127,7 +174,7 @@ def _get_or_create_log(
         appointment_id=appointment.id,
         client_id=appointment.client_id,
         channel=channel,
-        notification_type=TYPE_APPOINTMENT_CONFIRMATION,
+        notification_type=notification_type,
         provider=provider,
         status="pending",
         attempt_count=0,
@@ -142,7 +189,7 @@ def _get_or_create_log(
             NotificationLog.query.filter_by(
                 appointment_id=appointment.id,
                 channel=channel,
-                notification_type=TYPE_APPOINTMENT_CONFIRMATION,
+                notification_type=notification_type,
             ).first()
         )
         if existing:
@@ -225,6 +272,7 @@ def send_appointment_email_confirmation(appointment: Appointment) -> dict[str, A
         log, should_send = _get_or_create_log(
             appointment,
             channel=CHANNEL_EMAIL,
+            notification_type=TYPE_APPOINTMENT_CONFIRMATION,
             provider=get_provider_name(),
         )
         if log is None:
@@ -326,6 +374,130 @@ def send_appointment_email_confirmation(appointment: Appointment) -> dict[str, A
         return {"status": "failed"}
 
 
+def send_appointment_staff_email_alert(appointment: Appointment) -> dict[str, Any]:
+    """
+    Email the assigned staff member (employee → user.email) about a new booking.
+    Never raises. Returns {"status": "sent"|"failed"|"skipped"}.
+    """
+    try:
+        if appointment.status in {"canceled", "cancelled"}:
+            return {"status": "skipped"}
+
+        log, should_send = _get_or_create_log(
+            appointment,
+            channel=CHANNEL_EMAIL,
+            notification_type=TYPE_APPOINTMENT_STAFF_ALERT,
+            provider=get_provider_name(),
+        )
+        if log is None:
+            return {"status": "failed"}
+        if not should_send:
+            return {
+                "status": log.status
+                if log.status in _TERMINAL_SKIP_STATUSES | {"failed"}
+                else "skipped"
+            }
+
+        to_email = _resolve_staff_email(appointment)
+        if not to_email:
+            status = _mark_skipped(
+                log,
+                error_code="missing_staff_email",
+                error_message="Assigned employee has no valid user email.",
+            )
+            return {"status": status}
+
+        customer_email = _resolve_customer_email(appointment)
+        if customer_email and customer_email.lower() == to_email.lower():
+            status = _mark_skipped(
+                log,
+                error_code="same_as_customer",
+                error_message="Staff email matches customer; customer confirmation covers it.",
+                recipient=to_email,
+            )
+            return {"status": status}
+
+        if not _email_enabled():
+            if not getattr(send_appointment_staff_email_alert, "_warned_disabled", False):
+                logger.info("Email notifications are disabled (EMAIL_NOTIFICATIONS_ENABLED).")
+                send_appointment_staff_email_alert._warned_disabled = True  # type: ignore[attr-defined]
+            status = _mark_skipped(
+                log,
+                error_code="disabled",
+                error_message="Email notifications are disabled.",
+                recipient=to_email,
+            )
+            return {"status": status}
+
+        if not email_configured():
+            if not getattr(send_appointment_staff_email_alert, "_warned_config", False):
+                logger.warning("Email notifications enabled but provider is incomplete.")
+                send_appointment_staff_email_alert._warned_config = True  # type: ignore[attr-defined]
+            status = _mark_skipped(
+                log,
+                error_code="not_configured",
+                error_message="Email is not fully configured.",
+                recipient=to_email,
+            )
+            return {"status": status}
+
+        business = appointment.business
+        service = appointment.service_type
+        if business is None or service is None:
+            status = _mark_failed(
+                log,
+                error_code="missing_tenant_data",
+                error_message="Appointment is missing business or service data.",
+                recipient=to_email,
+            )
+            return {"status": status}
+
+        subject, text_body, html_body = build_appointment_staff_alert_email(
+            staff_name=_staff_first_name(appointment),
+            shop_name=business.name,
+            customer_name=_customer_full_name(appointment),
+            service_name=service.name,
+            appointment_date=_format_appointment_date(appointment.start_time),
+            appointment_time=_format_appointment_time(appointment.start_time),
+            customer_phone=(appointment.client_phone or "").strip() or None,
+            customer_email=customer_email,
+        )
+
+        send_result = send_email(
+            to_email=to_email,
+            subject=subject,
+            text_body=text_body,
+            html_body=html_body,
+        )
+
+        if send_result.ok:
+            status = _mark_sent(
+                log,
+                recipient=to_email,
+                message_sid=send_result.message_id,
+                template_identifier="appointment_staff_alert_email",
+            )
+            return {"status": status}
+
+        status = _mark_failed(
+            log,
+            error_code=send_result.error_code or "send_failed",
+            error_message=send_result.error_message or "Email send failed.",
+            recipient=to_email,
+        )
+        return {"status": status}
+    except Exception:
+        logger.exception(
+            "Unexpected error sending appointment staff email alert",
+            extra={"appointment_id": str(getattr(appointment, "id", ""))},
+        )
+        try:
+            db.session.rollback()
+        except Exception:
+            pass
+        return {"status": "failed"}
+
+
 def send_appointment_confirmation(appointment: Appointment) -> dict[str, Any]:
     """
     Send a WhatsApp appointment confirmation after successful commit.
@@ -338,6 +510,7 @@ def send_appointment_confirmation(appointment: Appointment) -> dict[str, Any]:
         log, should_send = _get_or_create_log(
             appointment,
             channel=CHANNEL_WHATSAPP,
+            notification_type=TYPE_APPOINTMENT_CONFIRMATION,
             provider=WHATSAPP_PROVIDER_NAME,
         )
         if log is None:
@@ -441,18 +614,25 @@ def send_appointment_confirmation(appointment: Appointment) -> dict[str, Any]:
 def notify_appointment_created(appointment: Appointment) -> dict[str, Any]:
     """
     Fan-out notifications after appointment create.
-    Email runs when a valid email is present; WhatsApp is opt-in via env.
+    Customer email + assigned staff email when addresses are present;
+    WhatsApp is opt-in via env.
     """
     email_result = send_appointment_email_confirmation(appointment)
+    staff_email_result = send_appointment_staff_email_alert(appointment)
     if _whatsapp_enabled():
         whatsapp_result = send_appointment_confirmation(appointment)
     else:
         whatsapp_result = {"status": "skipped"}
     return {
         "email": email_result.get("status"),
+        "staff_email": staff_email_result.get("status"),
         "whatsapp": whatsapp_result.get("status"),
-        # Backward compatible single status (prefer email when it ran).
+        # Backward compatible single status (prefer customer email when it ran).
         "status": email_result.get("status")
         if email_result.get("status") != "skipped"
-        else whatsapp_result.get("status"),
+        else (
+            staff_email_result.get("status")
+            if staff_email_result.get("status") != "skipped"
+            else whatsapp_result.get("status")
+        ),
     }

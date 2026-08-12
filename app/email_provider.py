@@ -156,6 +156,80 @@ def build_appointment_confirmation_email(
     return subject, text_body, html_body
 
 
+def build_appointment_staff_alert_email(
+    *,
+    staff_name: str,
+    shop_name: str,
+    customer_name: str,
+    service_name: str,
+    appointment_date: str,
+    appointment_time: str,
+    customer_phone: str | None = None,
+    customer_email: str | None = None,
+) -> tuple[str, str, str]:
+    """Staff notification when a new booking is assigned to them. Returns (subject, text, html)."""
+    subject = f"Nueva cita asignada — {shop_name}"
+    lines = [
+        f"Hola {staff_name},",
+        "",
+        f"Tienes una nueva cita en {shop_name}.",
+        "",
+        f"Cliente: {customer_name}",
+        f"Servicio: {service_name}",
+        f"Fecha: {appointment_date}",
+        f"Hora: {appointment_time}",
+    ]
+    if customer_phone:
+        lines.append(f"Teléfono del cliente: {customer_phone}")
+    if customer_email and is_valid_email(customer_email):
+        lines.append(f"Correo del cliente: {customer_email}")
+    lines.extend(
+        [
+            "",
+            "Revisa el portal del negocio para más detalles.",
+            "",
+            "— Barber Suite",
+        ]
+    )
+    text_body = "\n".join(lines)
+
+    detail_rows = [
+        ("Cliente", customer_name),
+        ("Servicio", service_name),
+        ("Fecha", appointment_date),
+        ("Hora", appointment_time),
+    ]
+    if customer_phone:
+        detail_rows.append(("Teléfono", customer_phone))
+    if customer_email and is_valid_email(customer_email):
+        detail_rows.append(("Correo", customer_email))
+
+    rows_html = "".join(
+        f"<tr><td style='padding:6px 12px 6px 0;color:#64748b;'>{k}</td>"
+        f"<td style='padding:6px 0;color:#0f172a;font-weight:600;'>{v}</td></tr>"
+        for k, v in detail_rows
+    )
+    html_body = f"""\
+<html>
+  <body style="font-family:system-ui,-apple-system,Segoe UI,sans-serif;background:#f8fafc;padding:24px;">
+    <div style="max-width:520px;margin:0 auto;background:#ffffff;border-radius:12px;padding:28px;border:1px solid #e2e8f0;">
+      <p style="margin:0 0 8px;color:#0f172a;font-size:18px;font-weight:700;">Hola {staff_name},</p>
+      <p style="margin:0 0 20px;color:#334155;font-size:15px;">
+        Tienes una nueva cita en <strong>{shop_name}</strong>.
+      </p>
+      <table style="border-collapse:collapse;width:100%;font-size:14px;margin-bottom:20px;">
+        {rows_html}
+      </table>
+      <p style="margin:0;color:#64748b;font-size:13px;">
+        Revisa el portal del negocio para más detalles.
+      </p>
+    </div>
+  </body>
+</html>
+"""
+    return subject, text_body, html_body
+
+
 def _send_via_resend(
     *,
     to_email: str,
