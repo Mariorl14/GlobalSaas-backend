@@ -14,6 +14,7 @@ from decimal import Decimal, InvalidOperation
 
 from flask import Blueprint, jsonify, request
 from sqlalchemy import and_, false, func, or_
+from sqlalchemy.exc import IntegrityError
 
 from app.extensions import db
 from app.models import (
@@ -315,6 +316,7 @@ def _get_appointment_for_tenant(
     ctx: ShopContext, appointment_id: uuid.UUID
 ) -> Appointment | None:
     q = Appointment.query.filter_by(id=appointment_id, business_id=ctx.business_id)
+    # Owners/admins may act on any appointment in the shop.
     if ctx.is_staff:
         if not ctx.employee_id:
             return None
@@ -896,14 +898,24 @@ def delete_appointment(ctx: ShopContext, appointment_id: str):
     aid = _parse_uuid(appointment_id)
     if not aid:
         return _json_error("ID inválido.", 400)
-    a = _get_appointment_for_tenant(ctx, aid)
+    a = Appointment.query.filter_by(id=aid, business_id=ctx.business_id).first()
     if not a:
         return _json_error("Cita no encontrada.", 404)
+    if ctx.is_staff:
+        if not ctx.employee_id or a.employee_id != ctx.employee_id:
+            return _json_error("Solo puedes eliminar tus propias citas.", 403)
     client = Client.query.get(a.client_id)
-    db.session.delete(a)
-    if client and client.appointments_amount > 0:
-        client.appointments_amount -= 1
-    db.session.commit()
+    try:
+        db.session.delete(a)
+        if client and (client.appointments_amount or 0) > 0:
+            client.appointments_amount -= 1
+        db.session.commit()
+    except IntegrityError:
+        db.session.rollback()
+        return _json_error(
+            "No se pudo eliminar la cita porque tiene registros asociados.",
+            409,
+        )
     return ("", 204)
 
 
