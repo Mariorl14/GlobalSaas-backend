@@ -41,9 +41,9 @@ def test_walk_in_creates_completed_sale_and_reuses_customer(app, client):
         db.session.add(admin)
         db.session.commit()
         headers = _auth_header(admin, bundle["business"].id)
-        completed = datetime.utcnow().replace(second=0, microsecond=0)
+        start = datetime(2026, 8, 12, 15, 0, 0)
         duration = int(bundle["service"].duration or 30)
-        expected_start = completed - timedelta(minutes=duration)
+        expected_end = start + timedelta(minutes=duration)
 
         res = client.post(
             "/api/shop/appointments/walk-in",
@@ -53,7 +53,7 @@ def test_walk_in_creates_completed_sale_and_reuses_customer(app, client):
                 "service_type_id": str(bundle["service"].id),
                 "employee_id": str(bundle["employee"].id),
                 "payment_method": "sinpe",
-                "completed_at": completed.isoformat(),
+                "start_time": start.isoformat(),
             },
             headers=headers,
         )
@@ -62,8 +62,8 @@ def test_walk_in_creates_completed_sale_and_reuses_customer(app, client):
         assert body["status"] == "completed"
         assert body["source"] == "walk_in"
         assert body["client_name"].startswith("Carlos")
-        assert expected_start.strftime("%Y-%m-%dT%H:%M") in (body["start_time"] or "")
-        assert completed.strftime("%Y-%m-%dT%H:%M") in (body["end_time"] or "")
+        assert start.strftime("%Y-%m-%dT%H:%M") in (body["start_time"] or "")
+        assert expected_end.strftime("%Y-%m-%dT%H:%M") in (body["end_time"] or "")
 
         appt_id = body["id"]
         key = appointment_sale_idempotency_key(uuid.UUID(appt_id))
@@ -88,7 +88,7 @@ def test_walk_in_creates_completed_sale_and_reuses_customer(app, client):
                 "service_type_id": str(bundle["service"].id),
                 "employee_id": str(bundle["employee"].id),
                 "payment_method": "cash",
-                "completed_at": completed.isoformat(),
+                "start_time": start.isoformat(),
             },
             headers=headers,
         )

@@ -721,8 +721,8 @@ def _find_or_create_walkin_client(
 @shop_jwt_required
 def create_walk_in(ctx: ShopContext):
     """
-    Fast in-shop sale: find/create customer, stamp now, mark completed, record POS.
-    Does not change scheduled booking. Times should be naive local wall-clock from the client.
+    Fast in-shop sale: find/create customer, mark completed, record POS.
+    Staff send the attended day and hour (naive local wall-clock). End is start + duration.
     """
     payload = request.get_json(silent=True) or {}
     name = (payload.get("name") or payload.get("client_name") or "").strip()
@@ -750,19 +750,14 @@ def create_walk_in(ctx: ShopContext):
     if not emp:
         return _json_error("Empleado no encontrado.", 404)
 
-    # Walk-in is recorded as the service just finishing now.
-    # End = completion moment; start = end minus service duration
-    # (e.g. 60 min corte completed at 16:00 → 15:00–16:00).
-    # Prefer client naive local clock so Costa Rica wall-time is preserved on Render.
     duration = int(st.duration or 30)
     if duration <= 0:
         duration = 30
-    end = (
-        _parse_dt(payload.get("completed_at"))
-        or _parse_dt(payload.get("end_time"))
-        or datetime.now().replace(microsecond=0)
-    )
-    start = end - timedelta(minutes=duration)
+    start = _parse_dt(payload.get("start_time"))
+    if not start:
+        return _json_error("El día y la hora atendida son obligatorios.", 400)
+    start = start.replace(minute=0, second=0, microsecond=0)
+    end = start + timedelta(minutes=duration)
 
     client = _find_or_create_walkin_client(
         ctx,
