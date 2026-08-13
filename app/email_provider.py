@@ -7,6 +7,7 @@ which blocks outbound SMTP ports 25/465/587). Falls back to SMTP otherwise
 
 from __future__ import annotations
 
+import html
 import json
 import logging
 import re
@@ -227,6 +228,166 @@ def build_appointment_staff_alert_email(
   </body>
 </html>
 """
+    return subject, text_body, html_body
+
+
+def _esc(value: str) -> str:
+    return html.escape(value or "", quote=True)
+
+
+def _detail_rows_html(rows: list[tuple[str, str]]) -> str:
+    return "".join(
+        f"<tr><td style='padding:6px 12px 6px 0;color:#64748b;vertical-align:top;'>{_esc(k)}</td>"
+        f"<td style='padding:6px 0;color:#0f172a;font-weight:600;'>{_esc(v)}</td></tr>"
+        for k, v in rows
+        if v
+    )
+
+
+def _email_shell(*, greeting: str, intro_html: str, rows_html: str, extra_html: str = "") -> str:
+    return f"""\
+<html>
+  <body style="font-family:system-ui,-apple-system,Segoe UI,sans-serif;background:#f8fafc;padding:24px;">
+    <div style="max-width:520px;margin:0 auto;background:#ffffff;border-radius:12px;padding:28px;border:1px solid #e2e8f0;">
+      <p style="margin:0 0 8px;color:#0f172a;font-size:18px;font-weight:700;">{greeting}</p>
+      <p style="margin:0 0 20px;color:#334155;font-size:15px;">{intro_html}</p>
+      <table style="border-collapse:collapse;width:100%;font-size:14px;margin-bottom:20px;">
+        {rows_html}
+      </table>
+      {extra_html}
+    </div>
+  </body>
+</html>
+"""
+
+
+def build_appointment_reschedule_email(
+    *,
+    customer_name: str,
+    shop_name: str,
+    service_name: str,
+    barber_name: str,
+    original_when: str,
+    proposed_when: str,
+    accept_url: str,
+    business_message: str | None = None,
+) -> tuple[str, str, str]:
+    subject = f"Cambio de horario — {shop_name}"
+    lines = [
+        f"Hola {customer_name},",
+        "",
+        f"Necesitamos hacer un pequeño ajuste a tu cita en {shop_name}.",
+        "",
+        f"Cita original: {original_when}",
+        f"Nuevo horario propuesto: {proposed_when}",
+        f"Servicio: {service_name}",
+        f"Barbero: {barber_name}",
+    ]
+    if business_message:
+        lines.extend(["", "Mensaje del negocio:", f'"{business_message}"'])
+    lines.extend(
+        [
+            "",
+            "Si el nuevo horario te funciona, confirma aquí:",
+            accept_url,
+            "",
+            "Si no te funciona, contacta el negocio para elegir otro horario.",
+            "",
+            "— Barber Suite",
+        ]
+    )
+    text_body = "\n".join(lines)
+    rows_html = _detail_rows_html(
+        [
+            ("Cita original", original_when),
+            ("Nuevo horario", proposed_when),
+            ("Servicio", service_name),
+            ("Barbero", barber_name),
+        ]
+    )
+    message_html = ""
+    if business_message:
+        message_html = (
+            "<p style='margin:0 0 16px;color:#334155;font-size:14px;'>"
+            "Mensaje del negocio:<br>"
+            f"<em>“{_esc(business_message)}”</em></p>"
+        )
+    cta = (
+        f"<p style='margin:0 0 16px;'>"
+        f"<a href='{_esc(accept_url)}' style='display:inline-block;background:#0f172a;"
+        f"color:#ffffff;text-decoration:none;padding:12px 18px;border-radius:8px;"
+        f"font-weight:600;font-size:14px;'>Aceptar nuevo horario</a></p>"
+        "<p style='margin:0;color:#64748b;font-size:13px;'>"
+        "Si el horario propuesto no te funciona, contacta el negocio.</p>"
+    )
+    html_body = _email_shell(
+        greeting=f"Hola {_esc(customer_name)},",
+        intro_html=f"Necesitamos hacer un pequeño ajuste a tu cita en <strong>{_esc(shop_name)}</strong>.",
+        rows_html=rows_html,
+        extra_html=message_html + cta,
+    )
+    return subject, text_body, html_body
+
+
+def build_appointment_cancellation_email(
+    *,
+    customer_name: str,
+    shop_name: str,
+    service_name: str,
+    barber_name: str,
+    appointment_when: str,
+    reason_text: str | None = None,
+    booking_url: str | None = None,
+) -> tuple[str, str, str]:
+    subject = f"Cita cancelada — {shop_name}"
+    lines = [
+        f"Hola {customer_name},",
+        "",
+        f"Lamentablemente tu cita en {shop_name} ha sido cancelada.",
+        "",
+        f"Cita: {appointment_when}",
+        f"Servicio: {service_name}",
+        f"Barbero: {barber_name}",
+    ]
+    if reason_text:
+        lines.extend(["", f"Motivo: {reason_text}"])
+    lines.extend(["", "Pedimos disculpas por las molestias."])
+    if booking_url:
+        lines.extend(["", "Puedes reservar otra cita aquí:", booking_url])
+    lines.extend(["", "— Barber Suite"])
+    text_body = "\n".join(lines)
+    rows_html = _detail_rows_html(
+        [
+            ("Cita", appointment_when),
+            ("Servicio", service_name),
+            ("Barbero", barber_name),
+        ]
+    )
+    extra = ""
+    if reason_text:
+        extra += (
+            "<p style='margin:0 0 16px;color:#334155;font-size:14px;'>"
+            f"Motivo: {_esc(reason_text)}</p>"
+        )
+    extra += (
+        "<p style='margin:0 0 16px;color:#64748b;font-size:13px;'>"
+        "Pedimos disculpas por las molestias.</p>"
+    )
+    if booking_url:
+        extra += (
+            f"<p style='margin:0;'>"
+            f"<a href='{_esc(booking_url)}' style='display:inline-block;background:#0f172a;"
+            f"color:#ffffff;text-decoration:none;padding:12px 18px;border-radius:8px;"
+            f"font-weight:600;font-size:14px;'>Reservar otra cita</a></p>"
+        )
+    html_body = _email_shell(
+        greeting=f"Hola {_esc(customer_name)},",
+        intro_html=(
+            f"Lamentablemente tu cita en <strong>{_esc(shop_name)}</strong> ha sido cancelada."
+        ),
+        rows_html=rows_html,
+        extra_html=extra,
+    )
     return subject, text_body, html_body
 
 

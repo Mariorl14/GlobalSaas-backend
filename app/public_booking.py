@@ -14,7 +14,7 @@ from typing import Any
 
 from flask import Blueprint, jsonify, request
 from flask_jwt_extended import create_access_token, verify_jwt_in_request
-from sqlalchemy import and_, func, text
+from sqlalchemy import and_, func, or_, text
 from werkzeug.security import check_password_hash, generate_password_hash
 
 from app.customer_auth import CUSTOMER_ROLE, get_customer_context
@@ -25,7 +25,9 @@ from app.name_utils import staff_display_label
 
 public_booking = Blueprint("public_booking", __name__, url_prefix="/api/public")
 
-BLOCKING_STATUSES = frozenset({"scheduled", "confirmed", "completed", "pending"})
+BLOCKING_STATUSES = frozenset(
+    {"scheduled", "confirmed", "completed", "pending", "reschedule_pending"}
+)
 SLOT_STEP_MINUTES = 15
 _MAX_NOTES_LEN = 4000
 _PHONE_MIN_LEN = 6
@@ -245,19 +247,59 @@ def _day_window_local(d: date) -> tuple[datetime, datetime]:
 
 
 def _busy_intervals(
-    business_id: uuid.UUID, employee_id: uuid.UUID, day_start: datetime, day_end: datetime
+    business_id: uuid.UUID,
+    employee_id: uuid.UUID,
+    day_start: datetime,
+    day_end: datetime,
+    exclude_id: uuid.UUID | None = None,
 ) -> list[tuple[datetime, datetime]]:
-    rows = (
-        Appointment.query.filter(
-            Appointment.business_id == business_id,
-            Appointment.employee_id == employee_id,
-            Appointment.start_time < day_end,
-            Appointment.end_time > day_start,
-            Appointment.status.in_(BLOCKING_STATUSES),
+    """Occupied windows: confirmed start/end plus any pending proposed slot."""
+    filters = [
+        Appointment.business_id == business_id,
+        Appointment.employee_id == employee_id,
+        Appointment.status.in_(BLOCKING_STATUSES),
+        or_(
+            and_(Appointment.start_time < day_end, Appointment.end_time > day_start),
+            and_(
+                Appointment.proposed_start_time.isnot(None),
+                Appointment.proposed_start_time < day_end,
+                Appointment.proposed_end_time > day_start,
+            ),
+        ),
+    ]
+    if exclude_id is not None:
+        filters.append(Appointment.id != exclude_id)
+    rows = Appointment.query.filter(*filters).all()
+    blocks: list[tuple[datetime, datetime]] = []
+    for a in rows:
+        if a.start_time and a.end_time and a.start_time < day_end and a.end_time > day_start:
+            blocks.append((a.start_time, a.end_time))
+        if (
+            a.proposed_start_time
+            and a.proposed_end_time
+            and a.proposed_start_time < day_end
+            and a.proposed_end_time > day_start
+        ):
+            blocks.append((a.proposed_start_time, a.proposed_end_time))
+    return blocks
+
+
+def employee_slot_conflicts(
+    business_id: uuid.UUID,
+    employee_id: uuid.UUID,
+    start: datetime,
+    end: datetime,
+    exclude_id: uuid.UUID | None = None,
+) -> bool:
+    day_start, day_end = _day_window_local(start.date())
+    busy = _busy_intervals(business_id, employee_id, day_start, day_end, exclude_id=exclude_id)
+    if start.date() != end.date():
+        other_start, other_end = _day_window_local(end.date())
+        extra = _busy_intervals(
+            business_id, employee_id, other_start, other_end, exclude_id=exclude_id
         )
-        .all()
-    )
-    return [(a.start_time, a.end_time) for a in rows]
+        busy = busy + extra
+    return _overlaps(start, end, busy)
 
 
 def _overlaps(a_start: datetime, a_end: datetime, blocks: list[tuple[datetime, datetime]]) -> bool:
@@ -889,3 +931,53 @@ def create_public_booking(slug: str):
         ),
         201,
     )
+
+
+@public_booking.route("/appointments/reschedule/<token>", methods=["GET"])
+def public_reschedule_preview(token: str):
+    from app.appointment_lifecycle import (
+        TOKEN_INVALID_MSG,
+        find_reschedule_by_token,
+        reschedule_preview,
+        reschedule_token_error,
+    )
+
+    appointment = find_reschedule_by_token(token)
+    if not appointment:
+        return _json_error(TOKEN_INVALID_MSG, 404)
+    err = reschedule_token_error(appointment)
+    if err:
+        return _json_error(err, 400)
+    return jsonify(reschedule_preview(appointment)), 200
+
+
+@public_booking.route("/appointments/reschedule/<token>/accept", methods=["POST"])
+def public_reschedule_accept(token: str):
+    from app.appointment_lifecycle import (
+        LifecycleError,
+        TOKEN_INVALID_MSG,
+        accept_reschedule,
+        find_reschedule_by_token,
+    )
+    from app.appointment_notifications import format_appointment_when
+
+    appointment = find_reschedule_by_token(token)
+    if not appointment:
+        return _json_error(TOKEN_INVALID_MSG, 404)
+    try:
+        accept_reschedule(appointment)
+        db.session.commit()
+    except LifecycleError as exc:
+        db.session.rollback()
+        return _json_error(exc.message, exc.status_code)
+
+    shop = appointment.business.name if appointment.business else ""
+    return jsonify(
+        {
+            "status": "accepted",
+            "business_name": shop,
+            "start_time": appointment.start_time.isoformat() if appointment.start_time else None,
+            "when_label": format_appointment_when(appointment.start_time),
+            "message": "Appointment Updated",
+        }
+    ), 200

@@ -27,7 +27,19 @@ from app.models import (
     User,
 )
 from app.tenant_auth import ShopContext, shop_admin_required, shop_jwt_required
-from app.appointment_notifications import notify_appointment_created
+from app.appointment_notifications import (
+    customer_notification_warning,
+    notify_appointment_created,
+    resolve_customer_email,
+    send_appointment_cancellation_notification,
+    send_appointment_reschedule_notification,
+)
+from app.appointment_lifecycle import (
+    LifecycleError,
+    cancel_appointment as apply_cancel_appointment,
+    clear_reschedule_fields,
+    propose_reschedule,
+)
 from app.shop_insights import build_insights, parse_goals, serialize_goals
 from app.inventory_movements import (
     InventoryMovementError,
@@ -54,7 +66,16 @@ from app.inventory_kinds import (
 shop_api = Blueprint("shop_api", __name__, url_prefix="/api/shop")
 
 APPOINTMENT_STATUSES = frozenset(
-    {"scheduled", "confirmed", "completed", "canceled", "cancelled", "no_show", "pending"}
+    {
+        "scheduled",
+        "confirmed",
+        "completed",
+        "canceled",
+        "cancelled",
+        "no_show",
+        "pending",
+        "reschedule_pending",
+    }
 )
 
 DAY_LABELS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
@@ -255,6 +276,14 @@ def _appointment_to_dict(a: Appointment) -> dict:
         "status": a.status,
         "notes": a.notes,
         "source": a.source,
+        "proposed_start_time": a.proposed_start_time.isoformat()
+        if a.proposed_start_time
+        else None,
+        "proposed_end_time": a.proposed_end_time.isoformat()
+        if a.proposed_end_time
+        else None,
+        "cancel_reason": a.cancel_reason,
+        "cancel_message": a.cancel_message,
     }
 
 
@@ -858,22 +887,31 @@ def update_appointment(ctx: ShopContext, appointment_id: str):
             return _json_error("Empleado no encontrado.", 404)
         a.employee_id = eid
 
+    times_changed = False
     if "start_time" in payload:
         t = _parse_dt(payload.get("start_time"))
         if not t:
             return _json_error("start_time inválido.", 400)
         a.start_time = t
+        times_changed = True
     if "end_time" in payload:
         t = _parse_dt(payload.get("end_time"))
         if not t:
             return _json_error("end_time inválido.", 400)
         a.end_time = t
+        times_changed = True
+    if times_changed and a.reschedule_token:
+        clear_reschedule_fields(a)
+        if (a.status or "").strip().lower() == "reschedule_pending" and "status" not in payload:
+            a.status = "scheduled"
     if "status" in payload:
         new_status = _normalize_appointment_status(payload.get("status"))
         becoming_completed = (
             new_status == "completed" and prev_status != "completed"
         )
         a.status = new_status
+        if new_status != "reschedule_pending":
+            clear_reschedule_fields(a)
     if "notes" in payload:
         a.notes = payload.get("notes")
 
@@ -890,6 +928,95 @@ def update_appointment(ctx: ShopContext, appointment_id: str):
 
     db.session.commit()
     return jsonify(_appointment_to_dict(a)), 200
+
+
+@shop_api.route("/appointments/<appointment_id>/reschedule", methods=["POST"])
+@shop_jwt_required
+def propose_appointment_reschedule(ctx: ShopContext, appointment_id: str):
+    aid = _parse_uuid(appointment_id)
+    if not aid:
+        return _json_error("ID inválido.", 400)
+    a = _get_appointment_for_tenant(ctx, aid)
+    if not a:
+        return _json_error("Cita no encontrada.", 404)
+
+    payload = request.get_json(silent=True) or {}
+    new_start = _parse_dt(payload.get("start_time") or payload.get("proposed_start_time"))
+    new_end = _parse_dt(payload.get("end_time") or payload.get("proposed_end_time"))
+    if not new_start:
+        return _json_error("start_time inválido.", 400)
+    send_email = payload.get("send_email", True)
+    if send_email is None:
+        send_email = True
+
+    try:
+        propose_reschedule(
+            a,
+            new_start=new_start,
+            new_end=new_end,
+            message=payload.get("message"),
+        )
+    except LifecycleError as exc:
+        return _json_error(exc.message, exc.status_code)
+
+    db.session.commit()
+
+    has_email = bool(resolve_customer_email(a))
+    notify_result = None
+    if send_email and has_email:
+        notify_result = send_appointment_reschedule_notification(a)
+    warning = customer_notification_warning(
+        notify_result,
+        send_requested=bool(send_email),
+        has_email=has_email,
+    )
+    body = _appointment_to_dict(a)
+    body["notification_status"] = (notify_result or {}).get("status")
+    if warning:
+        body["warning"] = warning
+    return jsonify(body), 200
+
+
+@shop_api.route("/appointments/<appointment_id>/cancel", methods=["POST"])
+@shop_jwt_required
+def cancel_shop_appointment(ctx: ShopContext, appointment_id: str):
+    aid = _parse_uuid(appointment_id)
+    if not aid:
+        return _json_error("ID inválido.", 400)
+    a = _get_appointment_for_tenant(ctx, aid)
+    if not a:
+        return _json_error("Cita no encontrada.", 404)
+
+    payload = request.get_json(silent=True) or {}
+    send_email = payload.get("send_email", True)
+    if send_email is None:
+        send_email = True
+
+    try:
+        apply_cancel_appointment(
+            a,
+            reason=payload.get("reason"),
+            message=payload.get("message"),
+        )
+    except LifecycleError as exc:
+        return _json_error(exc.message, exc.status_code)
+
+    db.session.commit()
+
+    has_email = bool(resolve_customer_email(a))
+    notify_result = None
+    if send_email and has_email:
+        notify_result = send_appointment_cancellation_notification(a)
+    warning = customer_notification_warning(
+        notify_result,
+        send_requested=bool(send_email),
+        has_email=has_email,
+    )
+    body = _appointment_to_dict(a)
+    body["notification_status"] = (notify_result or {}).get("status")
+    if warning:
+        body["warning"] = warning
+    return jsonify(body), 200
 
 
 @shop_api.route("/appointments/<appointment_id>", methods=["DELETE"])

@@ -13,6 +13,7 @@ NOTIFICATION_TYPES = frozenset(
         "appointment_reminder",
         "appointment_cancellation",
         "appointment_staff_alert",
+        "appointment_reschedule",
     }
 )
 NOTIFICATION_STATUSES = frozenset(

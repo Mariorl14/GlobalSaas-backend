@@ -14,7 +14,9 @@ from flask import current_app
 from sqlalchemy.exc import IntegrityError
 
 from app.email_provider import (
+    build_appointment_cancellation_email,
     build_appointment_confirmation_email,
+    build_appointment_reschedule_email,
     build_appointment_staff_alert_email,
     email_configured,
     get_provider_name,
@@ -37,6 +39,8 @@ CHANNEL_WHATSAPP = "whatsapp"
 CHANNEL_EMAIL = "email"
 TYPE_APPOINTMENT_CONFIRMATION = "appointment_confirmation"
 TYPE_APPOINTMENT_STAFF_ALERT = "appointment_staff_alert"
+TYPE_APPOINTMENT_RESCHEDULE = "appointment_reschedule"
+TYPE_APPOINTMENT_CANCELLATION = "appointment_cancellation"
 _RECIPIENT_MAX = 255
 
 _TERMINAL_SKIP_STATUSES = frozenset({"sent", "delivered", "read", "skipped"})
@@ -96,6 +100,31 @@ def _customer_first_name(appointment: Appointment) -> str:
     return name.split()[0]
 
 
+_WEEKDAYS_ES = (
+    "lunes",
+    "martes",
+    "miércoles",
+    "jueves",
+    "viernes",
+    "sábado",
+    "domingo",
+)
+_MONTHS_ES = (
+    "enero",
+    "febrero",
+    "marzo",
+    "abril",
+    "mayo",
+    "junio",
+    "julio",
+    "agosto",
+    "septiembre",
+    "octubre",
+    "noviembre",
+    "diciembre",
+)
+
+
 def _format_appointment_date(dt: datetime | None) -> str:
     if dt is None:
         return "—"
@@ -106,6 +135,59 @@ def _format_appointment_time(dt: datetime | None) -> str:
     if dt is None:
         return "—"
     return dt.strftime("%H:%M")
+
+
+def format_appointment_when(dt: datetime | None) -> str:
+    """Naive local wall-clock (same convention as stored appointment times)."""
+    if dt is None:
+        return "—"
+    weekday = _WEEKDAYS_ES[dt.weekday()]
+    month = _MONTHS_ES[dt.month - 1]
+    return f"{weekday.capitalize()}, {dt.day} de {month} de {dt.year} a las {_format_appointment_time(dt)}"
+
+
+def _service_name(appointment: Appointment) -> str:
+    st = appointment.service_type
+    return (st.name if st else "Servicio") or "Servicio"
+
+
+def _shop_name(appointment: Appointment) -> str:
+    business = appointment.business
+    return (business.name if business else "el negocio") or "el negocio"
+
+
+def _booking_url(appointment: Appointment) -> str | None:
+    business = appointment.business
+    origin = (current_app.config.get("FRONTEND_URL") or "").rstrip("/")
+    slug = (business.public_slug if business else None) or ""
+    if origin and slug:
+        return f"{origin}/book/{slug}"
+    return None
+
+
+def _reschedule_accept_url(token: str) -> str:
+    origin = (current_app.config.get("FRONTEND_URL") or "").rstrip("/")
+    if origin:
+        return f"{origin}/appointment/reschedule/confirm/{token}"
+    return f"/appointment/reschedule/confirm/{token}"
+
+
+def customer_notification_warning(
+    result: dict[str, Any] | None,
+    *,
+    send_requested: bool,
+    has_email: bool,
+) -> str | None:
+    if not send_requested:
+        return None
+    if not has_email:
+        return "Cita actualizada. El cliente no tiene correo, no se envió notificación."
+    status = (result or {}).get("status")
+    if status == "sent":
+        return None
+    if status == "skipped":
+        return "Cita actualizada. El correo al cliente no se envió."
+    return "Cita actualizada, pero no se pudo enviar el correo al cliente."
 
 
 def _resolve_country_code(appointment: Appointment) -> str | None:
@@ -119,7 +201,7 @@ def _resolve_country_code(appointment: Appointment) -> str | None:
     return default if len(default) == 2 else None
 
 
-def _resolve_customer_email(appointment: Appointment) -> str | None:
+def resolve_customer_email(appointment: Appointment) -> str | None:
     candidates = [
         (appointment.client_email or "").strip(),
         (appointment.client.email if appointment.client else "") or "",
@@ -154,10 +236,12 @@ def _get_or_create_log(
     channel: str,
     notification_type: str = TYPE_APPOINTMENT_CONFIRMATION,
     provider: str | None = None,
+    force_retry: bool = False,
 ) -> tuple[NotificationLog | None, bool]:
     """
     Returns (log, should_send).
     should_send is False when an existing record already consumed the idempotency slot.
+    force_retry resets a prior log so a new reschedule/cancel email can go out.
     """
     existing = (
         NotificationLog.query.filter_by(
@@ -167,6 +251,17 @@ def _get_or_create_log(
         ).first()
     )
     if existing:
+        if force_retry:
+            existing.status = "pending"
+            existing.error_code = None
+            existing.error_message = None
+            existing.provider_message_sid = None
+            existing.sent_at = None
+            existing.updated_at = datetime.utcnow()
+            if provider:
+                existing.provider = provider
+            db.session.commit()
+            return existing, True
         return existing, existing.status not in _ACTIVE_SKIP_STATUSES
 
     log = NotificationLog(
@@ -284,7 +379,7 @@ def send_appointment_email_confirmation(appointment: Appointment) -> dict[str, A
                 else "skipped"
             }
 
-        to_email = _resolve_customer_email(appointment)
+        to_email = resolve_customer_email(appointment)
         if not to_email:
             status = _mark_skipped(
                 log,
@@ -407,7 +502,7 @@ def send_appointment_staff_email_alert(appointment: Appointment) -> dict[str, An
             )
             return {"status": status}
 
-        customer_email = _resolve_customer_email(appointment)
+        customer_email = resolve_customer_email(appointment)
         if customer_email and customer_email.lower() == to_email.lower():
             status = _mark_skipped(
                 log,
@@ -609,6 +704,163 @@ def send_appointment_confirmation(appointment: Appointment) -> dict[str, Any]:
         except Exception:
             pass
         return {"status": "failed"}
+
+
+def _send_typed_customer_email(
+    appointment: Appointment,
+    *,
+    notification_type: str,
+    subject: str,
+    text_body: str,
+    html_body: str,
+    force_retry: bool = False,
+) -> dict[str, Any]:
+    """Send a customer email. Never raises. Returns {status, warning?}."""
+    try:
+        log, should_send = _get_or_create_log(
+            appointment,
+            channel=CHANNEL_EMAIL,
+            notification_type=notification_type,
+            provider=get_provider_name(),
+            force_retry=force_retry,
+        )
+        if log is None:
+            return {"status": "failed"}
+        if not should_send:
+            return {
+                "status": log.status
+                if log.status in _TERMINAL_SKIP_STATUSES | {"failed"}
+                else "skipped"
+            }
+
+        to_email = resolve_customer_email(appointment)
+        if not to_email:
+            status = _mark_skipped(
+                log,
+                error_code="missing_email",
+                error_message="No customer email on appointment or client.",
+            )
+            return {"status": status}
+
+        if not _email_enabled():
+            status = _mark_skipped(
+                log,
+                error_code="disabled",
+                error_message="Email notifications are disabled.",
+                recipient=to_email,
+            )
+            return {"status": status}
+
+        if not email_configured():
+            status = _mark_skipped(
+                log,
+                error_code="not_configured",
+                error_message="Email SMTP is not fully configured.",
+                recipient=to_email,
+            )
+            return {"status": status}
+
+        result = send_email(
+            to_email=to_email,
+            subject=subject,
+            text_body=text_body,
+            html_body=html_body,
+        )
+        if result.ok:
+            status = _mark_sent(
+                log,
+                recipient=to_email,
+                message_sid=result.message_id,
+                template_identifier=notification_type,
+            )
+            return {"status": status}
+
+        status = _mark_failed(
+            log,
+            error_code=result.error_code or "send_failed",
+            error_message=result.error_message or "Email send failed.",
+            recipient=to_email,
+        )
+        return {"status": status}
+    except Exception:
+        logger.exception(
+            "Unexpected error sending appointment email",
+            extra={"appointment_id": str(getattr(appointment, "id", "")), "type": notification_type},
+        )
+        try:
+            db.session.rollback()
+        except Exception:
+            pass
+        return {"status": "failed"}
+
+
+def send_appointment_reschedule_notification(appointment: Appointment) -> dict[str, Any]:
+    """Email the customer a proposed new time + accept link. Never raises."""
+    token = (appointment.reschedule_token or "").strip()
+    if not token:
+        return {"status": "skipped"}
+    original = appointment.previous_start_time or appointment.start_time
+    proposed = appointment.proposed_start_time
+    subject, text_body, html_body = build_appointment_reschedule_email(
+        customer_name=_customer_first_name(appointment),
+        shop_name=_shop_name(appointment),
+        service_name=_service_name(appointment),
+        barber_name=_employee_display_name(appointment),
+        original_when=format_appointment_when(original),
+        proposed_when=format_appointment_when(proposed),
+        accept_url=_reschedule_accept_url(token),
+        business_message=(appointment.reschedule_message or "").strip() or None,
+    )
+    return _send_typed_customer_email(
+        appointment,
+        notification_type=TYPE_APPOINTMENT_RESCHEDULE,
+        subject=subject,
+        text_body=text_body,
+        html_body=html_body,
+        force_retry=True,
+    )
+
+
+def send_appointment_cancellation_notification(appointment: Appointment) -> dict[str, Any]:
+    """Email the customer that the business cancelled the appointment. Never raises."""
+    reason_parts = []
+    reason_label = _cancel_reason_label(appointment.cancel_reason)
+    if reason_label:
+        reason_parts.append(reason_label)
+    msg = (appointment.cancel_message or "").strip()
+    if msg:
+        reason_parts.append(msg)
+    reason_text = " — ".join(reason_parts) if reason_parts else None
+    when = appointment.start_time
+    subject, text_body, html_body = build_appointment_cancellation_email(
+        customer_name=_customer_first_name(appointment),
+        shop_name=_shop_name(appointment),
+        service_name=_service_name(appointment),
+        barber_name=_employee_display_name(appointment),
+        appointment_when=format_appointment_when(when),
+        reason_text=reason_text,
+        booking_url=_booking_url(appointment),
+    )
+    return _send_typed_customer_email(
+        appointment,
+        notification_type=TYPE_APPOINTMENT_CANCELLATION,
+        subject=subject,
+        text_body=text_body,
+        html_body=html_body,
+        force_retry=True,
+    )
+
+
+def _cancel_reason_label(code: str | None) -> str | None:
+    labels = {
+        "barber_unavailable": "Barbero no disponible",
+        "business_closed": "Negocio cerrado",
+        "scheduling_conflict": "Conflicto de agenda",
+        "customer_requested": "Cancelación solicitada por el cliente",
+        "other": "Otro",
+    }
+    key = (code or "").strip().lower()
+    return labels.get(key)
 
 
 def notify_appointment_created(appointment: Appointment) -> dict[str, Any]:

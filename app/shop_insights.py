@@ -1373,7 +1373,7 @@ def build_insights(
         for a in appts
         if a.start_time
         and a.start_time >= now
-        and _status_norm(a.status) in {"scheduled", "confirmed"}
+        and _status_norm(a.status) in {"scheduled", "confirmed", "reschedule_pending"}
     ]
 
     def upcoming_revenue(until: datetime) -> float:

@@ -67,3 +67,5 @@ class Config:
     MAIL_DEFAULT_SENDER = os.getenv("MAIL_DEFAULT_SENDER")
     MAIL_DEFAULT_SENDER_NAME = os.getenv("MAIL_DEFAULT_SENDER_NAME", "Barber Suite")
     MAIL_TIMEOUT = int(os.getenv("MAIL_TIMEOUT", "15"))
+    # Public frontend origin for customer email links (no trailing slash).
+    FRONTEND_URL = (os.getenv("FRONTEND_URL") or os.getenv("PUBLIC_APP_URL") or "").rstrip("/")
