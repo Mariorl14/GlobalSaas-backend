@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 
 from flask import Blueprint, jsonify, request
-from sqlalchemy import false, func, or_
+from sqlalchemy import and_, false, func, or_
 
 from app.extensions import db
 from app.models import (
@@ -264,6 +264,50 @@ def _client_scope_ids(business_id: uuid.UUID):
         .distinct()
     )
     return or_(Client.business_id == business_id, Client.id.in_(appt_subq))
+
+
+def _client_access_filter(ctx: ShopContext):
+    """
+    Owners/admins: all clients of the business.
+    Staff: only clients who booked with them, prefer them, or have a sale with them.
+    """
+    base = _client_scope_ids(ctx.business_id)
+    if not ctx.is_staff:
+        return base
+    if not ctx.employee_id:
+        return false()
+    eid = ctx.employee_id
+    booked_ids = (
+        db.session.query(Appointment.client_id)
+        .filter(
+            Appointment.business_id == ctx.business_id,
+            Appointment.employee_id == eid,
+        )
+        .distinct()
+    )
+    sold_ids = (
+        db.session.query(Sale.client_id)
+        .filter(
+            Sale.business_id == ctx.business_id,
+            Sale.employee_id == eid,
+            Sale.client_id.isnot(None),
+        )
+        .distinct()
+    )
+    return and_(
+        base,
+        or_(
+            Client.id.in_(booked_ids),
+            Client.id.in_(sold_ids),
+            Client.preferred_employee_id == eid,
+        ),
+    )
+
+
+def _get_client_for_tenant(ctx: ShopContext, client_id: uuid.UUID) -> Client | None:
+    return Client.query.filter(
+        _client_access_filter(ctx), Client.id == client_id
+    ).first()
 
 
 def _get_appointment_for_tenant(
@@ -715,7 +759,7 @@ def delete_appointment(ctx: ShopContext, appointment_id: str):
 @shop_jwt_required
 def list_clients(ctx: ShopContext):
     search = (request.args.get("q") or "").strip().lower()
-    q = Client.query.filter(_client_scope_ids(ctx.business_id))
+    q = Client.query.filter(_client_access_filter(ctx))
     if search:
         like = f"%{search}%"
         q = q.filter(
@@ -736,7 +780,7 @@ def get_client(ctx: ShopContext, client_id: str):
     cid = _parse_uuid(client_id)
     if not cid:
         return _json_error("ID inválido.", 400)
-    c = Client.query.filter(_client_scope_ids(ctx.business_id), Client.id == cid).first()
+    c = _get_client_for_tenant(ctx, cid)
     if not c:
         return _json_error("Cliente no encontrado.", 404)
     return jsonify(_client_to_dict(c)), 200
@@ -748,15 +792,12 @@ def client_appointments(ctx: ShopContext, client_id: str):
     cid = _parse_uuid(client_id)
     if not cid:
         return _json_error("ID inválido.", 400)
-    c = Client.query.filter(_client_scope_ids(ctx.business_id), Client.id == cid).first()
+    c = _get_client_for_tenant(ctx, cid)
     if not c:
         return _json_error("Cliente no encontrado.", 404)
-    rows = (
-        Appointment.query.filter_by(business_id=ctx.business_id, client_id=cid)
-        .order_by(Appointment.start_time.desc())
-        .limit(200)
-        .all()
-    )
+    q = Appointment.query.filter_by(business_id=ctx.business_id, client_id=cid)
+    q = _apply_staff_appointment_scope(q, ctx)
+    rows = q.order_by(Appointment.start_time.desc()).limit(200).all()
     return jsonify({"items": [_appointment_to_dict(a) for a in rows]}), 200
 
 
@@ -766,15 +807,12 @@ def client_sales(ctx: ShopContext, client_id: str):
     cid = _parse_uuid(client_id)
     if not cid:
         return _json_error("ID inválido.", 400)
-    c = Client.query.filter(_client_scope_ids(ctx.business_id), Client.id == cid).first()
+    c = _get_client_for_tenant(ctx, cid)
     if not c:
         return _json_error("Cliente no encontrado.", 404)
-    rows = (
-        Sale.query.filter_by(business_id=ctx.business_id, client_id=cid)
-        .order_by(Sale.created_at.desc())
-        .limit(100)
-        .all()
-    )
+    q = Sale.query.filter_by(business_id=ctx.business_id, client_id=cid)
+    q = _apply_staff_sale_scope(q, ctx)
+    rows = q.order_by(Sale.created_at.desc()).limit(100).all()
     return jsonify({"items": [sale_to_dict(s) for s in rows]}), 200
 
 
@@ -789,7 +827,12 @@ def create_client(ctx: ShopContext):
         return _json_error("first_name, last_name y phone son obligatorios.", 400)
 
     pref = _parse_uuid(payload.get("preferred_employee_id"))
-    if pref:
+    # Staff-created clients belong to them so they appear in their client list.
+    if ctx.is_staff:
+        if not ctx.employee_id:
+            return _json_error("Tu cuenta de staff no tiene empleado asociado.", 403)
+        pref = ctx.employee_id
+    elif pref:
         emp = Employee.query.filter_by(id=pref, business_id=ctx.business_id).first()
         if not emp:
             return _json_error("preferred_employee_id no válido.", 400)
@@ -816,7 +859,7 @@ def update_client(ctx: ShopContext, client_id: str):
     cid = _parse_uuid(client_id)
     if not cid:
         return _json_error("ID inválido.", 400)
-    c = Client.query.filter(_client_scope_ids(ctx.business_id), Client.id == cid).first()
+    c = _get_client_for_tenant(ctx, cid)
     if not c:
         return _json_error("Cliente no encontrado.", 404)
 
@@ -842,7 +885,7 @@ def update_client(ctx: ShopContext, client_id: str):
         c.address = (payload.get("address") or "").strip() or None
     if "notes" in payload:
         c.notes = payload.get("notes")
-    if "preferred_employee_id" in payload:
+    if "preferred_employee_id" in payload and not ctx.is_staff:
         pref = _parse_uuid(payload.get("preferred_employee_id"))
         if pref:
             emp = Employee.query.filter_by(id=pref, business_id=ctx.business_id).first()
@@ -860,10 +903,12 @@ def update_client(ctx: ShopContext, client_id: str):
 @shop_api.route("/clients/<client_id>", methods=["DELETE"])
 @shop_jwt_required
 def delete_client(ctx: ShopContext, client_id: str):
+    if ctx.is_staff:
+        return _json_error("Solo el propietario o administrador puede eliminar clientes.", 403)
     cid = _parse_uuid(client_id)
     if not cid:
         return _json_error("ID inválido.", 400)
-    c = Client.query.filter(_client_scope_ids(ctx.business_id), Client.id == cid).first()
+    c = _get_client_for_tenant(ctx, cid)
     if not c:
         return _json_error("Cliente no encontrado.", 404)
     if Appointment.query.filter_by(client_id=cid).first():
