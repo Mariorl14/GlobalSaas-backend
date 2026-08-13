@@ -164,10 +164,13 @@ def create_user():
     db.session.flush()  # generate user.id
 
     display = user_full_name(user) or email.split("@")[0]
+    from app.commissions import default_commission_for_role
+
     employee = Employee(
         user_id=user.id,
         business_id=business_id,
         display_name=display[:120],
+        commission_percentage=default_commission_for_role(role),
     )
     db.session.add(employee)
     db.session.commit()
@@ -300,7 +303,15 @@ def update_user(user_id):
         user.role = requested_role
 
     if user.employee is None:
-        db.session.add(Employee(user_id=user.id, business_id=user.business_id))
+        from app.commissions import default_commission_for_role
+
+        db.session.add(
+            Employee(
+                user_id=user.id,
+                business_id=user.business_id,
+                commission_percentage=default_commission_for_role(user.role),
+            )
+        )
         db.session.flush()
     else:
         user.employee.business_id = user.business_id

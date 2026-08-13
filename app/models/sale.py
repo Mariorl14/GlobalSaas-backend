@@ -124,6 +124,10 @@ class SaleItem(db.Model):
     unit_price = db.Column(Numeric(10, 2), nullable=False)
     unit_cost = db.Column(Numeric(10, 2), nullable=True)
     line_total = db.Column(Numeric(12, 2), nullable=False)
+    # Snapshot of the barber's service commission at sale time (null on products / history).
+    commission_percentage = db.Column(Numeric(5, 2), nullable=True)
+    staff_earnings = db.Column(Numeric(12, 2), nullable=True)
+    business_earnings = db.Column(Numeric(12, 2), nullable=True)
     inventory_movement_id = db.Column(
         UUID(as_uuid=True),
         ForeignKey("inventory_movement.id", ondelete="SET NULL"),

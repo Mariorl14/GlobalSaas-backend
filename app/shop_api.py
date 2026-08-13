@@ -1316,16 +1316,24 @@ def delete_service(ctx: ShopContext, service_id: str):
 @shop_api.route("/inventory", methods=["GET"])
 @shop_jwt_required
 def list_inventory(ctx: ShopContext):
-    denied = _deny_staff_inventory(ctx)
-    if denied:
-        return denied
+    sellable = (request.args.get("sellable") or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+    # Staff may list sellable retail products for POS; full inventory stays managers-only.
+    if ctx.is_staff and not sellable:
+        denied = _deny_staff_inventory(ctx)
+        if denied:
+            return denied
     q = InventoryProduct.query.filter_by(business_id=ctx.business_id)
     kind = normalize_item_kind(request.args.get("item_kind"))
     if kind:
         q = q.filter(InventoryProduct.item_kind == kind)
-    sellable = (request.args.get("sellable") or "").strip().lower()
-    if sellable in {"1", "true", "yes"}:
+    if sellable:
         q = q.filter(InventoryProduct.item_kind == ITEM_KIND_RETAIL)
+        if ctx.is_staff:
+            q = q.filter(InventoryProduct.is_active.is_(True))
     items = q.order_by(InventoryProduct.name).all()
     return jsonify({"items": [_inventory_to_dict(p) for p in items]}), 200
 
@@ -1688,9 +1696,6 @@ def create_inventory_movement(ctx: ShopContext, product_id: str):
 @shop_api.route("/inventory/<product_id>/sale", methods=["POST"])
 @shop_jwt_required
 def register_inventory_sale(ctx: ShopContext, product_id: str):
-    denied = _deny_staff_inventory(ctx)
-    if denied:
-        return denied
     pid = _parse_uuid(product_id)
     if not pid:
         return _json_error("ID inválido.", 400)
@@ -1700,20 +1705,33 @@ def register_inventory_sale(ctx: ShopContext, product_id: str):
     except (TypeError, ValueError):
         return _json_error("quantity debe ser un entero.", 400)
 
+    sale_employee_id = ctx.employee_id
+    if ctx.is_staff:
+        if not ctx.employee_id:
+            return _json_error("Tu cuenta de staff no tiene empleado asociado.", 403)
+        sale_employee_id = ctx.employee_id
+    else:
+        sale_employee_id = _parse_uuid(payload.get("employee_id")) or ctx.employee_id
+
+    item: dict = {
+        "item_type": "product",
+        "product_id": str(pid),
+        "quantity": qty,
+    }
+    # Managers may still override price/cost from Inventario; quick sale omits these
+    # so create_sale uses the catalog price stored on the product.
+    if payload.get("unit_sale_price") not in (None, ""):
+        item["unit_price"] = payload.get("unit_sale_price")
+    if payload.get("unit_cost") not in (None, ""):
+        item["unit_cost"] = payload.get("unit_cost")
+
     try:
         sale, replayed = create_sale(
             business_id=ctx.business_id,
             created_by_user_id=ctx.user_id,
-            items=[
-                {
-                    "item_type": "product",
-                    "product_id": str(pid),
-                    "quantity": qty,
-                    "unit_price": payload.get("unit_sale_price"),
-                    "unit_cost": payload.get("unit_cost"),
-                }
-            ],
+            items=[item],
             client_id=_parse_uuid(payload.get("client_id")),
+            employee_id=sale_employee_id,
             notes=payload.get("notes"),
             payment_method=payload.get("payment_method"),
             idempotency_key=payload.get("idempotency_key")
@@ -1727,10 +1745,10 @@ def register_inventory_sale(ctx: ShopContext, product_id: str):
     product = InventoryProduct.query.filter_by(
         id=pid, business_id=ctx.business_id
     ).first()
-    item = next((i for i in sale.items if i.product_id == pid), None)
+    sale_item = next((i for i in sale.items if i.product_id == pid), None)
     mov = (
-        InventoryMovement.query.get(item.inventory_movement_id)
-        if item and item.inventory_movement_id
+        InventoryMovement.query.get(sale_item.inventory_movement_id)
+        if sale_item and sale_item.inventory_movement_id
         else None
     )
     return (
@@ -1889,6 +1907,9 @@ def _staff_row(emp: Employee) -> dict:
         "follows_business_hours": not bool(
             emp.work_hours_json and str(emp.work_hours_json).strip()
         ),
+        "commission_percentage": float(emp.commission_percentage)
+        if emp.commission_percentage is not None
+        else 50.0,
     }
 
 
@@ -1938,6 +1959,15 @@ def update_staff(ctx: ShopContext, employee_id: str):
             if hours_err:
                 return _json_error(hours_err, 400)
             emp.work_hours_json = normalized
+    if "commission_percentage" in payload:
+        from app.commissions import CommissionError, parse_commission_percentage
+
+        try:
+            emp.commission_percentage = parse_commission_percentage(
+                payload.get("commission_percentage")
+            )
+        except CommissionError as exc:
+            return _json_error(exc.message, 400)
 
     db.session.commit()
     return jsonify(_staff_row(emp)), 200

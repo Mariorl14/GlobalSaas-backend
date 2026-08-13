@@ -10,6 +10,7 @@ from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 
 from app.extensions import db
+from app.commissions import DEFAULT_STAFF_COMMISSION, split_service_line
 from app.inventory_movements import InventoryMovementError, apply_stock_movement
 from app.models import Appointment, Client, Employee, InventoryProduct, ServiceType
 from app.models.sale import (
@@ -84,6 +85,17 @@ def sale_item_to_dict(item: SaleItem) -> dict:
         "unit_price": float(item.unit_price),
         "unit_cost": float(item.unit_cost) if item.unit_cost is not None else None,
         "line_total": float(item.line_total),
+        "commission_percentage": (
+            float(item.commission_percentage)
+            if item.commission_percentage is not None
+            else None
+        ),
+        "staff_earnings": (
+            float(item.staff_earnings) if item.staff_earnings is not None else None
+        ),
+        "business_earnings": (
+            float(item.business_earnings) if item.business_earnings is not None else None
+        ),
         "inventory_movement_id": (
             str(item.inventory_movement_id) if item.inventory_movement_id else None
         ),
@@ -151,6 +163,12 @@ def create_sale(
     if not items:
         raise SaleError("Agrega al menos un servicio o producto.")
 
+    assigned_emp = None
+    if employee_id:
+        assigned_emp = Employee.query.filter_by(
+            id=employee_id, business_id=business_id
+        ).first()
+
     method = require_payment_method(payment_method)
 
     disc = _money(discount)
@@ -202,6 +220,13 @@ def create_sale(
             )
             line = (unit * qty).quantize(Decimal("0.01"))
             subtotal += line
+            if assigned_emp is None:
+                commission_pct = Decimal("0")
+            elif assigned_emp.commission_percentage is None:
+                commission_pct = DEFAULT_STAFF_COMMISSION
+            else:
+                commission_pct = Decimal(str(assigned_emp.commission_percentage))
+            commission_pct, staff_earn, biz_earn = split_service_line(line, commission_pct)
             normalized.append(
                 {
                     "item_type": "service",
@@ -212,6 +237,9 @@ def create_sale(
                     "unit_price": unit,
                     "unit_cost": None,
                     "line_total": line,
+                    "commission_percentage": commission_pct,
+                    "staff_earnings": staff_earn,
+                    "business_earnings": biz_earn,
                 }
             )
         else:
@@ -262,6 +290,9 @@ def create_sale(
                     "unit_price": unit,
                     "unit_cost": cost,
                     "line_total": line,
+                    "commission_percentage": None,
+                    "staff_earnings": None,
+                    "business_earnings": None,
                 }
             )
 
@@ -323,6 +354,9 @@ def create_sale(
                 unit_price=row["unit_price"],
                 unit_cost=row["unit_cost"],
                 line_total=row["line_total"],
+                commission_percentage=row.get("commission_percentage"),
+                staff_earnings=row.get("staff_earnings"),
+                business_earnings=row.get("business_earnings"),
                 inventory_movement_id=movement_id,
             )
         )

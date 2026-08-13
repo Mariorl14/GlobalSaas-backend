@@ -148,6 +148,11 @@ def apply_stock_movement(
     elif mtype in DECREASE_TYPES:
         after = before - quantity
         if after < 0:
+            if mtype == "sale":
+                raise InventoryMovementError(
+                    f"Solo hay {before} unidades disponibles.",
+                    400,
+                )
             raise InventoryMovementError(
                 f"Stock insuficiente. Disponible: {before}, solicitado: {quantity}."
             )

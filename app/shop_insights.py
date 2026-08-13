@@ -370,8 +370,9 @@ def _empty_insights_payload(
         "meta": {
             "currency_note": (
                 "Montos en colones costarricenses (₡). "
-                "Ingresos netos = servicios (POS + citas sin ticket) + productos "
-                "− descuentos + impuestos."
+                "Ingresos brutos = servicios (POS + citas sin ticket) + productos "
+                "− descuentos + impuestos. La comisión del equipo se descuenta "
+                "solo de servicios, no de productos."
             ),
             "unavailable": ["tips", "reviews"],
             "generated_at": now.isoformat() + "Z",
@@ -380,6 +381,8 @@ def _empty_insights_payload(
             "revenue": 0.0,
             "revenue_delta_pct": None,
             "service_revenue": 0.0,
+            "staff_commissions": 0.0,
+            "business_service_revenue": 0.0,
             "product_revenue": 0.0,
             "pos_service_revenue": 0.0,
             "discount_total": 0.0,
@@ -409,7 +412,21 @@ def _empty_insights_payload(
         "revenue_breakdown": [
             {
                 "key": "services",
-                "label": "Servicios",
+                "label": "Servicios (bruto)",
+                "amount": 0.0,
+                "pct": 0.0,
+                "available": True,
+            },
+            {
+                "key": "staff_commissions",
+                "label": "Comisiones del equipo",
+                "amount": 0.0,
+                "pct": 0.0,
+                "available": True,
+            },
+            {
+                "key": "business_services",
+                "label": "Servicios del negocio",
                 "amount": 0.0,
                 "pct": 0.0,
                 "available": True,
@@ -781,6 +798,11 @@ def build_insights(
         if _status_norm(a.status) == COMPLETED and not has_appointment_sale(a)
     )
     gross_service_revenue = round(cur["revenue"] + pos_service_revenue, 2)
+    staff_commissions = round(
+        sum(float(item.staff_earnings or 0) for item, _ in pos_service_rows),
+        2,
+    )
+    business_service_revenue = round(gross_service_revenue - staff_commissions, 2)
     gross_combined = cur["revenue"] + product_revenue + pos_service_revenue
     combined_revenue = round(gross_combined - period_discount + period_tax, 2)
     prev_gross = (
@@ -829,6 +851,8 @@ def build_insights(
         "revenue": combined_revenue,
         "revenue_delta_pct": _delta_pct(combined_revenue, prev_combined),
         "service_revenue": gross_service_revenue,
+        "staff_commissions": staff_commissions,
+        "business_service_revenue": business_service_revenue,
         "product_revenue": product_revenue,
         "pos_service_revenue": pos_service_revenue,
         "discount_total": period_discount,
@@ -939,19 +963,34 @@ def build_insights(
     # Revenue breakdown — gross services/products + discount line so amounts reconcile
     service_rev = gross_service_revenue
     net_after_adj = round(service_rev + product_revenue - period_discount + period_tax, 2)
+    breakdown_base = max(net_after_adj, gross_combined, 1)
     revenue_breakdown = [
         {
             "key": "services",
-            "label": "Servicios",
+            "label": "Servicios (bruto)",
             "amount": service_rev,
-            "pct": _pct(service_rev, max(net_after_adj, gross_combined)) or 0.0,
+            "pct": _pct(service_rev, breakdown_base) or 0.0,
+            "available": True,
+        },
+        {
+            "key": "staff_commissions",
+            "label": "Comisiones del equipo",
+            "amount": -staff_commissions,
+            "pct": _pct(staff_commissions, breakdown_base) or 0.0,
+            "available": True,
+        },
+        {
+            "key": "business_services",
+            "label": "Servicios del negocio",
+            "amount": business_service_revenue,
+            "pct": _pct(business_service_revenue, breakdown_base) or 0.0,
             "available": True,
         },
         {
             "key": "products",
             "label": "Productos",
             "amount": product_revenue,
-            "pct": _pct(product_revenue, max(net_after_adj, gross_combined)) or 0.0,
+            "pct": _pct(product_revenue, breakdown_base) or 0.0,
             "available": True,
         },
     ]
@@ -1031,7 +1070,14 @@ def build_insights(
 
     # Staff performance — POS service lines + legacy appts without sale
     staff_agg: dict[UUID, dict] = defaultdict(
-        lambda: {"total": 0, "completed": 0, "revenue": 0.0, "minutes": 0}
+        lambda: {
+            "total": 0,
+            "completed": 0,
+            "revenue": 0.0,
+            "staff_earnings": 0.0,
+            "business_share": 0.0,
+            "minutes": 0,
+        }
     )
     for a in period_appts:
         eid = a.employee_id
@@ -1042,7 +1088,10 @@ def build_insights(
         if st == COMPLETED:
             staff_agg[eid]["completed"] += 1
             if not has_appointment_sale(a):
-                staff_agg[eid]["revenue"] += _appt_price(a, price_map)
+                price = _appt_price(a, price_map)
+                staff_agg[eid]["revenue"] += price
+                # Pre-commission history: treat as 0% staff / 100% business.
+                staff_agg[eid]["business_share"] += price
         if st not in NON_REVENUE:
             staff_agg[eid]["minutes"] += duration_map.get(a.service_type_id, 0)
 
@@ -1050,7 +1099,16 @@ def build_insights(
         eid = sale.employee_id
         if not eid:
             continue
-        staff_agg[eid]["revenue"] += float(item.line_total or 0)
+        line = float(item.line_total or 0)
+        earn = float(item.staff_earnings or 0)
+        biz = (
+            float(item.business_earnings)
+            if item.business_earnings is not None
+            else line - earn
+        )
+        staff_agg[eid]["revenue"] += line
+        staff_agg[eid]["staff_earnings"] += earn
+        staff_agg[eid]["business_share"] += biz
         if not is_appointment_sale_key(sale.idempotency_key):
             staff_agg[eid]["completed"] += int(item.quantity or 0)
             staff_agg[eid]["total"] += int(item.quantity or 0)
@@ -1060,11 +1118,20 @@ def build_insights(
     for eid, agg in staff_agg.items():
         completed = agg["completed"]
         revenue = round(agg["revenue"], 2)
+        emp_row = next((e for e in employees if e.id == eid), None)
+        current_pct = (
+            float(emp_row.commission_percentage)
+            if emp_row is not None and emp_row.commission_percentage is not None
+            else 50.0
+        )
         staff_rows.append(
             {
                 "employee_id": str(eid),
                 "display_name": emp_name.get(eid) or "Staff",
                 "revenue": revenue,
+                "staff_earnings": round(agg["staff_earnings"], 2),
+                "business_share": round(agg["business_share"], 2),
+                "commission_percentage": current_pct,
                 "appointments_completed": completed,
                 "appointments_total": agg["total"],
                 "average_ticket": round(revenue / completed, 2) if completed else 0.0,
@@ -1086,6 +1153,11 @@ def build_insights(
                     "employee_id": str(e.id),
                     "display_name": staff_display_label(e),
                     "revenue": 0.0,
+                    "staff_earnings": 0.0,
+                    "business_share": 0.0,
+                    "commission_percentage": float(e.commission_percentage)
+                    if e.commission_percentage is not None
+                    else 50.0,
                     "appointments_completed": 0,
                     "appointments_total": 0,
                     "average_ticket": 0.0,
@@ -1702,8 +1774,9 @@ def build_insights(
         "meta": {
             "currency_note": (
                 "Montos en colones costarricenses (₡). "
-                "Ingresos netos = servicios (POS + citas sin ticket) + productos "
-                "− descuentos + impuestos."
+                "Ingresos brutos = servicios (POS + citas sin ticket) + productos "
+                "− descuentos + impuestos. La comisión del equipo se descuenta "
+                "solo de servicios, no de productos."
             ),
             "unavailable": ["tips", "reviews"],
             "generated_at": now.isoformat() + "Z",

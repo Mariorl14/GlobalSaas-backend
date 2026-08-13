@@ -1,6 +1,6 @@
 import uuid
 from sqlalchemy.dialects.postgresql import UUID
-from sqlalchemy import ForeignKey
+from sqlalchemy import ForeignKey, Numeric
 from app.extensions import db
 
 
@@ -29,6 +29,10 @@ class Employee(db.Model):
     # Optional weekly schedule (same JSON shape as business.business_hours_json).
     # NULL / blank = follow the business hours for every day.
     work_hours_json = db.Column(db.Text, nullable=True)
+    # Service commission % applied to completed services (0–100). Default 50 for barbers.
+    commission_percentage = db.Column(
+        Numeric(5, 2), nullable=False, default=50, server_default="50"
+    )
 
     user = db.relationship("User", back_populates="employee")
     business = db.relationship("Business", back_populates="employees")
