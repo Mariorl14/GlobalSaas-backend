@@ -369,6 +369,7 @@ def _empty_insights_payload(
         },
         "meta": {
             "currency_note": (
+                "Montos en colones costarricenses (₡). "
                 "Ingresos netos = servicios (POS + citas sin ticket) + productos "
                 "− descuentos + impuestos."
             ),
@@ -1651,13 +1652,13 @@ def build_insights(
     if top_services:
         insights.append(
             f"{top_services[0]['name']} es tu servicio más rentable del periodo "
-            f"(${top_services[0]['revenue']:,.2f})."
+            f"(₡{top_services[0]['revenue']:,.2f})."
         )
     if snapshot["average_ticket_delta_pct"] is not None and abs(snapshot["average_ticket_delta_pct"]) >= 1:
         sign = "+" if snapshot["average_ticket_delta_pct"] > 0 else ""
         insights.append(
             f"Ticket promedio {sign}{snapshot['average_ticket_delta_pct']}% "
-            f"(${snapshot['average_ticket']:,.2f})."
+            f"(₡{snapshot['average_ticket']:,.2f})."
         )
     if inactive_90:
         insights.append(
@@ -1670,11 +1671,11 @@ def build_insights(
     if best_selling:
         insights.append(
             f"{best_selling['name']} es tu producto más vendido "
-            f"({best_selling['units']} uds, ${best_selling['revenue']:,.2f})."
+            f"({best_selling['units']} uds, ₡{best_selling['revenue']:,.2f})."
         )
     if inventory["projected_gross_profit"] > 0:
         insights.append(
-            f"Tu inventario proyecta ~${inventory['projected_gross_profit']:,.2f} de margen bruto potencial."
+            f"Tu inventario proyecta ~₡{inventory['projected_gross_profit']:,.2f} de margen bruto potencial."
         )
     if not insights:
         insights.append(
@@ -1700,6 +1701,7 @@ def build_insights(
         },
         "meta": {
             "currency_note": (
+                "Montos en colones costarricenses (₡). "
                 "Ingresos netos = servicios (POS + citas sin ticket) + productos "
                 "− descuentos + impuestos."
             ),
