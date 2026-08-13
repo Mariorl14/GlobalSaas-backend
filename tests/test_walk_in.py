@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from flask_jwt_extended import create_access_token
 from werkzeug.security import generate_password_hash
@@ -41,7 +41,9 @@ def test_walk_in_creates_completed_sale_and_reuses_customer(app, client):
         db.session.add(admin)
         db.session.commit()
         headers = _auth_header(admin, bundle["business"].id)
-        start = datetime.utcnow().replace(second=0, microsecond=0)
+        completed = datetime.utcnow().replace(second=0, microsecond=0)
+        duration = int(bundle["service"].duration or 30)
+        expected_start = completed - timedelta(minutes=duration)
 
         res = client.post(
             "/api/shop/appointments/walk-in",
@@ -51,7 +53,7 @@ def test_walk_in_creates_completed_sale_and_reuses_customer(app, client):
                 "service_type_id": str(bundle["service"].id),
                 "employee_id": str(bundle["employee"].id),
                 "payment_method": "sinpe",
-                "start_time": start.isoformat(),
+                "completed_at": completed.isoformat(),
             },
             headers=headers,
         )
@@ -60,7 +62,8 @@ def test_walk_in_creates_completed_sale_and_reuses_customer(app, client):
         assert body["status"] == "completed"
         assert body["source"] == "walk_in"
         assert body["client_name"].startswith("Carlos")
-        assert start.strftime("%Y-%m-%dT%H:%M") in (body["start_time"] or "")
+        assert expected_start.strftime("%Y-%m-%dT%H:%M") in (body["start_time"] or "")
+        assert completed.strftime("%Y-%m-%dT%H:%M") in (body["end_time"] or "")
 
         appt_id = body["id"]
         key = appointment_sale_idempotency_key(uuid.UUID(appt_id))
@@ -85,7 +88,7 @@ def test_walk_in_creates_completed_sale_and_reuses_customer(app, client):
                 "service_type_id": str(bundle["service"].id),
                 "employee_id": str(bundle["employee"].id),
                 "payment_method": "cash",
-                "start_time": "2026-08-12T16:10:00",
+                "completed_at": completed.isoformat(),
             },
             headers=headers,
         )

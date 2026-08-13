@@ -750,19 +750,19 @@ def create_walk_in(ctx: ShopContext):
     if not emp:
         return _json_error("Empleado no encontrado.", 404)
 
-    # Prefer client-supplied naive local timestamps so Costa Rica wall-clock is preserved
-    # (shop UI stores naive local; Render's datetime.utcnow() would shift displayed time).
-    start = _parse_dt(payload.get("start_time"))
-    end = _parse_dt(payload.get("end_time"))
-    if start is None:
-        start = datetime.now().replace(microsecond=0)
-    if end is None:
-        duration = int(st.duration or 30)
-        if duration <= 0:
-            duration = 30
-        end = start + timedelta(minutes=duration)
-    if end <= start:
-        end = start + timedelta(minutes=max(1, int(st.duration or 30)))
+    # Walk-in is recorded as the service just finishing now.
+    # End = completion moment; start = end minus service duration
+    # (e.g. 60 min corte completed at 16:00 → 15:00–16:00).
+    # Prefer client naive local clock so Costa Rica wall-time is preserved on Render.
+    duration = int(st.duration or 30)
+    if duration <= 0:
+        duration = 30
+    end = (
+        _parse_dt(payload.get("completed_at"))
+        or _parse_dt(payload.get("end_time"))
+        or datetime.now().replace(microsecond=0)
+    )
+    start = end - timedelta(minutes=duration)
 
     client = _find_or_create_walkin_client(
         ctx,
