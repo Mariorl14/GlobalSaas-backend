@@ -253,6 +253,7 @@ def _appointment_to_dict(a: Appointment) -> dict:
         "end_time": a.end_time.isoformat() if a.end_time else None,
         "status": a.status,
         "notes": a.notes,
+        "source": a.source,
     }
 
 
@@ -650,6 +651,165 @@ def create_appointment(ctx: ShopContext):
     payload["staff_email_notification_status"] = notification_result.get("staff_email")
     payload["whatsapp_notification_status"] = notification_result.get("whatsapp")
     return jsonify(payload), 201
+
+
+def _phone_digits(value: str | None) -> str:
+    return "".join(ch for ch in (value or "") if ch.isdigit())
+
+
+def _split_person_name(raw: str) -> tuple[str, str]:
+    parts = (raw or "").strip().split()
+    if not parts:
+        return "", "—"
+    if len(parts) == 1:
+        return parts[0][:80], "—"
+    return parts[0][:80], " ".join(parts[1:])[:80]
+
+
+def _find_or_create_walkin_client(
+    ctx: ShopContext,
+    *,
+    name: str,
+    phone: str,
+    email: str | None,
+    preferred_employee_id: uuid.UUID | None,
+) -> Client:
+    """Match by phone within the tenant; create if missing. Safe, minimal updates."""
+    first_name, last_name = _split_person_name(name)
+    phone_raw = phone.strip()[:20]
+    digits = _phone_digits(phone_raw)
+    email_clean = (email or "").strip()[:120] or None
+
+    q = Client.query.filter(
+        Client.business_id == ctx.business_id, Client.phone == phone_raw
+    ).first()
+    if q is None and digits:
+        q = Client.query.filter(
+            Client.business_id == ctx.business_id, Client.phone == digits[:20]
+        ).first()
+    if q is None and digits:
+        for row in Client.query.filter(Client.business_id == ctx.business_id).all():
+            if _phone_digits(row.phone) == digits:
+                q = row
+                break
+
+    if q:
+        if email_clean and not (q.email or "").strip():
+            q.email = email_clean
+        # Fill a missing last name when the walk-in provides a fuller name.
+        if last_name != "—" and (not q.last_name or q.last_name.strip() in {"", "—"}):
+            q.last_name = last_name
+        if first_name and (not q.first_name or q.first_name.strip() in {"", "—"}):
+            q.first_name = first_name
+        return q
+
+    c = Client(
+        business_id=ctx.business_id,
+        first_name=first_name or "Cliente",
+        last_name=last_name or "—",
+        phone=phone_raw or digits[:20],
+        email=email_clean,
+        preferred_employee_id=preferred_employee_id,
+        appointments_amount=0,
+    )
+    db.session.add(c)
+    db.session.flush()
+    return c
+
+
+@shop_api.route("/appointments/walk-in", methods=["POST"])
+@shop_jwt_required
+def create_walk_in(ctx: ShopContext):
+    """
+    Fast in-shop sale: find/create customer, stamp now, mark completed, record POS.
+    Does not change scheduled booking. Times should be naive local wall-clock from the client.
+    """
+    payload = request.get_json(silent=True) or {}
+    name = (payload.get("name") or payload.get("client_name") or "").strip()
+    phone = (payload.get("phone") or payload.get("client_phone") or "").strip()
+    email = (payload.get("email") or payload.get("client_email") or "").strip() or None
+    sid = _parse_uuid(payload.get("service_type_id"))
+    eid = _parse_uuid(payload.get("employee_id"))
+
+    if ctx.is_staff:
+        if not ctx.employee_id:
+            return _json_error("Tu cuenta de staff no tiene empleado asociado.", 403)
+        eid = ctx.employee_id
+
+    if not name:
+        return _json_error("El nombre del cliente es obligatorio.", 400)
+    if not phone:
+        return _json_error("El teléfono del cliente es obligatorio.", 400)
+    if not sid or not eid:
+        return _json_error("Faltan service_type_id y employee_id.", 400)
+
+    st = ServiceType.query.filter_by(id=sid, business_id=ctx.business_id).first()
+    if not st:
+        return _json_error("Servicio no encontrado.", 404)
+    emp = Employee.query.filter_by(id=eid, business_id=ctx.business_id).first()
+    if not emp:
+        return _json_error("Empleado no encontrado.", 404)
+
+    # Prefer client-supplied naive local timestamps so Costa Rica wall-clock is preserved
+    # (shop UI stores naive local; Render's datetime.utcnow() would shift displayed time).
+    start = _parse_dt(payload.get("start_time"))
+    end = _parse_dt(payload.get("end_time"))
+    if start is None:
+        start = datetime.now().replace(microsecond=0)
+    if end is None:
+        duration = int(st.duration or 30)
+        if duration <= 0:
+            duration = 30
+        end = start + timedelta(minutes=duration)
+    if end <= start:
+        end = start + timedelta(minutes=max(1, int(st.duration or 30)))
+
+    client = _find_or_create_walkin_client(
+        ctx,
+        name=name,
+        phone=phone,
+        email=email,
+        preferred_employee_id=eid,
+    )
+    full_name = f"{client.first_name} {client.last_name}".strip()
+    if full_name.endswith("—"):
+        full_name = (client.first_name or name).strip()
+
+    a = Appointment(
+        client_id=client.id,
+        service_type_id=sid,
+        business_id=ctx.business_id,
+        employee_id=eid,
+        client_name=full_name[:120],
+        client_email=(client.email or email or "")[:120] or "—",
+        client_phone=client.phone,
+        start_time=start,
+        end_time=end,
+        status="completed",
+        notes=payload.get("notes"),
+        source="walk_in",
+    )
+    db.session.add(a)
+    client.appointments_amount = (client.appointments_amount or 0) + 1
+    db.session.flush()
+    try:
+        sale, _replayed = ensure_sale_for_completed_appointment(
+            a,
+            created_by_user_id=ctx.user_id,
+            payment_method=payload.get("payment_method"),
+        )
+    except SaleError as exc:
+        db.session.rollback()
+        return _json_error(exc.message, exc.status_code)
+    db.session.commit()
+
+    notification_result = notify_appointment_created(a)
+    body = _appointment_to_dict(a)
+    body["sale_id"] = str(sale.id)
+    body["notification_status"] = notification_result.get("status")
+    body["email_notification_status"] = notification_result.get("email")
+    body["staff_email_notification_status"] = notification_result.get("staff_email")
+    return jsonify(body), 201
 
 
 @shop_api.route("/appointments/<appointment_id>", methods=["PUT"])

@@ -41,6 +41,8 @@ class Appointment(db.Model):
     # scheduled | confirmed | completed | canceled | no_show | pending (legacy)
     status = db.Column(db.String(20), nullable=False)
     notes = db.Column(db.Text, nullable=True)
+    # Origin: walk_in | None (scheduled / public / historical)
+    source = db.Column(db.String(20), nullable=True)
 
     client = db.relationship("Client", back_populates="appointments")
     service_type = db.relationship("ServiceType", back_populates="appointments")
