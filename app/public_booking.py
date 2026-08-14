@@ -123,10 +123,11 @@ def _validate_public_customer_fields(
 ) -> str | None:
     if len(first) > _NAME_MAX or len(last) > _NAME_MAX:
         return "Nombre o apellidos demasiado largos."
-    if len(phone) > 20:
-        return "Teléfono demasiado largo."
-    if len(phone) < _PHONE_MIN_LEN:
-        return "Teléfono demasiado corto."
+    if phone:
+        if len(phone) > 20:
+            return "Teléfono demasiado largo."
+        if len(phone) < _PHONE_MIN_LEN:
+            return "Teléfono demasiado corto."
     if email is not None and email != "":
         if len(email) > 120 or not _EMAIL_RE.match(email):
             return "Email no válido."
@@ -598,21 +599,24 @@ def _find_or_create_client(
     email: str | None,
     notes: str | None,
 ) -> Client:
-    phone = phone.strip()
-    q = Client.query.filter(
-        and_(Client.business_id == business_id, Client.phone == phone)
-    ).first()
-    if q:
-        if email and not q.email:
-            q.email = email[:120]
-        if notes:
-            q.notes = (q.notes or "") + ("\n" if q.notes else "") + notes
-        return q
+    phone = (phone or "").strip()
+    # Only reuse by phone when one is given — blank numbers must not collapse
+    # unrelated walk-up customers into a single record.
+    if phone:
+        q = Client.query.filter(
+            and_(Client.business_id == business_id, Client.phone == phone)
+        ).first()
+        if q:
+            if email and not q.email:
+                q.email = email[:120]
+            if notes:
+                q.notes = (q.notes or "") + ("\n" if q.notes else "") + notes
+            return q
     c = Client(
         business_id=business_id,
         first_name=first_name.strip()[:80],
         last_name=last_name.strip()[:80],
-        phone=phone[:20],
+        phone=phone[:20] or None,
         email=(email or "").strip()[:120] or None,
         notes=notes,
         appointments_amount=0,
@@ -672,8 +676,8 @@ def customer_register(slug: str):
         return _json_error("El usuario debe tener al menos 3 caracteres.", 400)
     if not password or len(password) < 6:
         return _json_error("La contraseña debe tener al menos 6 caracteres.", 400)
-    if not all([first, last, phone]):
-        return _json_error("Faltan nombre, apellido o teléfono.", 400)
+    if not all([first, last]):
+        return _json_error("Faltan nombre o apellido.", 400)
 
     cust_err = _validate_public_customer_fields(first, last, phone, email, None)
     if cust_err:
@@ -689,9 +693,11 @@ def customer_register(slug: str):
         return _json_error("Ese nombre de usuario ya está en uso.", 409)
 
     # Reuse existing client by phone when possible; otherwise create new.
-    client = Client.query.filter(
-        and_(Client.business_id == b.id, Client.phone == phone)
-    ).first()
+    client = None
+    if phone:
+        client = Client.query.filter(
+            and_(Client.business_id == b.id, Client.phone == phone)
+        ).first()
     if client:
         if client.username and client.encrypted_password:
             return _json_error(
@@ -708,7 +714,7 @@ def customer_register(slug: str):
             business_id=b.id,
             first_name=first[:80],
             last_name=last[:80],
-            phone=phone[:20],
+            phone=phone[:20] or None,
             email=(email or "")[:120] or None,
             username=username[:80],
             encrypted_password=generate_password_hash(password),
@@ -824,9 +830,9 @@ def create_public_booking(slug: str):
 
     emp_req = _parse_uuid(payload.get("employee_id")) if payload.get("employee_id") else None
 
-    if not all([sid, start_raw, end_raw, first, last, phone]):
+    if not all([sid, start_raw, end_raw, first, last]):
         return _json_error(
-            "Faltan service_id, start_time, end_time, first_name, last_name o phone.", 400
+            "Faltan service_id, start_time, end_time, first_name o last_name.", 400
         )
 
     norm = _normalize_booking_datetimes(start_raw, end_raw)
@@ -889,7 +895,7 @@ def create_public_booking(slug: str):
         # Keep profile fresh from form when they edit while logged in.
         client.first_name = first[:80]
         client.last_name = last[:80]
-        client.phone = phone[:20]
+        client.phone = phone[:20] or None
         if email:
             client.email = email[:120]
         if notes:
@@ -905,7 +911,7 @@ def create_public_booking(slug: str):
         employee_id=chosen.id,
         client_name=full_name,
         client_email=(email or client.email or "")[:120] or "—",
-        client_phone=phone[:20],
+        client_phone=phone[:20] or None,
         start_time=start,
         end_time=end,
         status="confirmed",

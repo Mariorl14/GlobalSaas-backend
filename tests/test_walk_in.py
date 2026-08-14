@@ -98,3 +98,38 @@ def test_walk_in_creates_completed_sale_and_reuses_customer(app, client):
         row = Client.query.get(uuid.UUID(body["client_id"]))
         assert row.email == "carlos@test.com"
         assert "Pérez" in (row.last_name or "")
+
+
+def test_walk_in_without_phone_creates_distinct_customers(app, client):
+    with app.app_context():
+        bundle = create_tenant_bundle(slug=f"walkin-opt-{uuid.uuid4().hex[:8]}")
+        admin = User(
+            business_id=bundle["business"].id,
+            email=f"admin-{uuid.uuid4().hex[:6]}@test.com",
+            encrypted_password=generate_password_hash("x"),
+            role="admin",
+            is_active=True,
+        )
+        db.session.add(admin)
+        db.session.commit()
+        headers = _auth_header(admin, bundle["business"].id)
+        start = datetime(2026, 8, 12, 15, 0, 0)
+        payload = {
+            "name": "Visitante",
+            "service_type_id": str(bundle["service"].id),
+            "employee_id": str(bundle["employee"].id),
+            "payment_method": "cash",
+            "start_time": start.isoformat(),
+        }
+
+        res = client.post("/api/shop/appointments/walk-in", json=payload, headers=headers)
+        assert res.status_code == 201, res.get_data(as_text=True)
+        first = res.get_json()
+        assert first["client_phone"] is None
+
+        res2 = client.post("/api/shop/appointments/walk-in", json=payload, headers=headers)
+        assert res2.status_code == 201, res2.get_data(as_text=True)
+        second = res2.get_json()
+        assert second["client_id"] != first["client_id"]
+        row = Client.query.get(uuid.UUID(first["client_id"]))
+        assert row.phone is None

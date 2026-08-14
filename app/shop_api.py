@@ -655,7 +655,7 @@ def create_appointment(ctx: ShopContext):
         employee_id=eid,
         client_name=full_name[:120],
         client_email=(client.email or "")[:120] or "—",
-        client_phone=client.phone,
+        client_phone=client.phone or None,
         start_time=start,
         end_time=end,
         status=status,
@@ -707,13 +707,15 @@ def _find_or_create_walkin_client(
 ) -> Client:
     """Match by phone within the tenant; create if missing. Safe, minimal updates."""
     first_name, last_name = _split_person_name(name)
-    phone_raw = phone.strip()[:20]
+    phone_raw = (phone or "").strip()[:20]
     digits = _phone_digits(phone_raw)
     email_clean = (email or "").strip()[:120] or None
 
-    q = Client.query.filter(
-        Client.business_id == ctx.business_id, Client.phone == phone_raw
-    ).first()
+    q = None
+    if phone_raw:
+        q = Client.query.filter(
+            Client.business_id == ctx.business_id, Client.phone == phone_raw
+        ).first()
     if q is None and digits:
         q = Client.query.filter(
             Client.business_id == ctx.business_id, Client.phone == digits[:20]
@@ -738,7 +740,7 @@ def _find_or_create_walkin_client(
         business_id=ctx.business_id,
         first_name=first_name or "Cliente",
         last_name=last_name or "—",
-        phone=phone_raw or digits[:20],
+        phone=phone_raw or None,
         email=email_clean,
         preferred_employee_id=preferred_employee_id,
         appointments_amount=0,
@@ -769,8 +771,6 @@ def create_walk_in(ctx: ShopContext):
 
     if not name:
         return _json_error("El nombre del cliente es obligatorio.", 400)
-    if not phone:
-        return _json_error("El teléfono del cliente es obligatorio.", 400)
     if not sid or not eid:
         return _json_error("Faltan service_type_id y employee_id.", 400)
 
@@ -808,7 +808,7 @@ def create_walk_in(ctx: ShopContext):
         employee_id=eid,
         client_name=full_name[:120],
         client_email=(client.email or email or "")[:120] or "—",
-        client_phone=client.phone,
+        client_phone=client.phone or None,
         start_time=start,
         end_time=end,
         status="completed",
@@ -865,7 +865,7 @@ def update_appointment(ctx: ShopContext, appointment_id: str):
         full_name = f"{client.first_name} {client.last_name}".strip()
         a.client_name = full_name[:120]
         a.client_email = (client.email or "")[:120] or "—"
-        a.client_phone = client.phone
+        a.client_phone = client.phone or None
 
     if "service_type_id" in payload:
         sid = _parse_uuid(payload.get("service_type_id"))
@@ -1116,9 +1116,9 @@ def create_client(ctx: ShopContext):
     payload = request.get_json(silent=True) or {}
     fn = (payload.get("first_name") or "").strip()
     ln = (payload.get("last_name") or "").strip()
-    phone = (payload.get("phone") or "").strip()
-    if not fn or not ln or not phone:
-        return _json_error("first_name, last_name y phone son obligatorios.", 400)
+    phone = (payload.get("phone") or "").strip() or None
+    if not fn or not ln:
+        return _json_error("first_name y last_name son obligatorios.", 400)
 
     pref = _parse_uuid(payload.get("preferred_employee_id"))
     # Staff-created clients belong to them so they appear in their client list.
@@ -1169,10 +1169,7 @@ def update_client(ctx: ShopContext, client_id: str):
             return _json_error("last_name vacío.", 400)
         c.last_name = v
     if "phone" in payload:
-        v = (payload.get("phone") or "").strip()
-        if not v:
-            return _json_error("phone vacío.", 400)
-        c.phone = v
+        c.phone = (payload.get("phone") or "").strip() or None
     if "email" in payload:
         c.email = (payload.get("email") or "").strip() or None
     if "address" in payload:

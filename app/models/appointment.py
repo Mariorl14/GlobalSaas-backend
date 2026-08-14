@@ -35,7 +35,7 @@ class Appointment(db.Model):
     )
     client_name = db.Column(db.String(120), nullable=False)
     client_email = db.Column(db.String(120), nullable=False)
-    client_phone = db.Column(db.String(20), nullable=False)
+    client_phone = db.Column(db.String(20), nullable=True)
     start_time = db.Column(DateTime, nullable=False)
     end_time = db.Column(DateTime, nullable=False)
     # scheduled | confirmed | completed | canceled | no_show | pending | reschedule_pending
