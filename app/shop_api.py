@@ -787,7 +787,12 @@ def create_walk_in(ctx: ShopContext):
     start = _parse_dt(payload.get("start_time"))
     if not start:
         return _json_error("El día y la hora atendida son obligatorios.", 400)
-    start = start.replace(minute=0, second=0, microsecond=0)
+    start = start.replace(second=0, microsecond=0)
+    # Snap to the same minute grid used by public booking / shop pickers.
+    allowed = (0, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55)
+    if start.minute not in allowed:
+        nearest = min(allowed, key=lambda m: abs(m - start.minute))
+        start = start.replace(minute=nearest)
     end = start + timedelta(minutes=duration)
 
     client = _find_or_create_walkin_client(

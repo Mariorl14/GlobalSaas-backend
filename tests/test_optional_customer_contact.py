@@ -45,7 +45,7 @@ def test_public_booking_without_phone_or_email(_mock_slot, _mock_send, client, a
     with app.app_context():
         bundle = create_tenant_bundle(slug=f"opt-{uuid.uuid4().hex[:8]}")
         start = datetime.now().replace(second=0, microsecond=0) + timedelta(days=2)
-        start = start.replace(minute=(start.minute // 15) * 15)
+        start = start.replace(minute=0, second=0, microsecond=0)
         end = start + timedelta(minutes=30)
 
         res = client.post(
@@ -75,7 +75,7 @@ def test_public_booking_short_phone_still_rejected(_mock_slot, _mock_send, clien
     with app.app_context():
         bundle = create_tenant_bundle(slug=f"opt-short-{uuid.uuid4().hex[:8]}")
         start = datetime.now().replace(second=0, microsecond=0) + timedelta(days=2)
-        start = start.replace(minute=(start.minute // 15) * 15)
+        start = start.replace(minute=0, second=0, microsecond=0)
         end = start + timedelta(minutes=30)
 
         res = client.post(

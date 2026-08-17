@@ -134,7 +134,15 @@ def _format_appointment_date(dt: datetime | None) -> str:
 def _format_appointment_time(dt: datetime | None) -> str:
     if dt is None:
         return "—"
-    return dt.strftime("%H:%M")
+    hour = dt.hour
+    minute = dt.minute
+    period = "PM" if hour >= 12 else "AM"
+    h12 = hour % 12
+    if h12 == 0:
+        h12 = 12
+    if minute == 0:
+        return f"{h12} {period}"
+    return f"{h12}:{minute:02d} {period}"
 
 
 def format_appointment_when(dt: datetime | None) -> str:

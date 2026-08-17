@@ -28,7 +28,9 @@ public_booking = Blueprint("public_booking", __name__, url_prefix="/api/public")
 BLOCKING_STATUSES = frozenset(
     {"scheduled", "confirmed", "completed", "pending", "reschedule_pending"}
 )
-SLOT_STEP_MINUTES = 15
+SLOT_STEP_MINUTES = 5
+# Public / walk-in clock minutes (includes on-the-hour). Matches shop 12h pickers.
+SLOT_ALLOWED_MINUTES = frozenset({0, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55})
 _MAX_NOTES_LEN = 4000
 _PHONE_MIN_LEN = 6
 _NAME_MAX = 80
@@ -78,7 +80,7 @@ def _is_on_slot_grid(dt: datetime) -> bool:
     return (
         dt.second == 0
         and dt.microsecond == 0
-        and dt.minute % SLOT_STEP_MINUTES == 0
+        and dt.minute in SLOT_ALLOWED_MINUTES
     )
 
 
@@ -339,6 +341,9 @@ def _iter_slots_for_employee(
             continue
         t = open_dt
         while t + duration <= close_dt:
+            if t.minute not in SLOT_ALLOWED_MINUTES:
+                t += step
+                continue
             if d == today and t < now:
                 t += step
                 continue
@@ -847,7 +852,10 @@ def create_public_booking(slug: str):
         return _json_error("Horario inválido.", 400)
 
     if not _is_on_slot_grid(start):
-        return _json_error("El inicio debe alinearse a franjas de 15 minutos.", 400)
+        return _json_error(
+            "El inicio debe alinearse a :00, :10, :15, :20, :25, :30, :35, :40, :45, :50 o :55.",
+            400,
+        )
 
     cust_err = _validate_public_customer_fields(first, last, phone, email, notes)
     if cust_err:

@@ -4,15 +4,21 @@ Shop Business Insights — derived analytics from existing tenant data.
 Service revenue prefers POS SaleItem rows (including tickets created when an
 appointment is marked completed). Completed appointments without a linked sale
 still contribute an estimate from the current ServiceType.price.
+
+Period filters use the shop's local calendar (appointments are naive local
+wall-clock). Sale / inventory movement timestamps are UTC-naive (utcnow), so
+those queries convert local bounds to UTC.
 """
 
 from __future__ import annotations
 
+import calendar
 import json
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import func, or_
 
@@ -45,6 +51,43 @@ DEFAULT_GOALS = {
     "monthly_product_sales": 0,
     "monthly_new_customers": 30,
 }
+
+# Product is CR-first; map country → IANA zone for calendar "Hoy" / "Este mes".
+_COUNTRY_TIMEZONES = {
+    "CR": "America/Costa_Rica",
+    "MX": "America/Mexico_City",
+    "US": "America/New_York",
+    "PA": "America/Panama",
+    "GT": "America/Guatemala",
+    "HN": "America/Tegucigalpa",
+    "NI": "America/Managua",
+    "SV": "America/El_Salvador",
+}
+_DEFAULT_TZ_NAME = "America/Costa_Rica"
+
+
+def business_timezone(business: Business | None) -> ZoneInfo:
+    code = ((getattr(business, "country_code", None) or "") or "").strip().upper()
+    name = _COUNTRY_TIMEZONES.get(code, _DEFAULT_TZ_NAME)
+    try:
+        return ZoneInfo(name)
+    except Exception:
+        return ZoneInfo(_DEFAULT_TZ_NAME)
+
+
+def local_now(tz: ZoneInfo) -> datetime:
+    """Naive local wall-clock now (matches appointment.start_time convention)."""
+    return datetime.now(tz).replace(tzinfo=None)
+
+
+def utc_now_naive() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def local_to_utc_naive(local_naive: datetime, tz: ZoneInfo) -> datetime:
+    """Interpret a naive local datetime in tz, return naive UTC."""
+    aware = local_naive.replace(tzinfo=tz)
+    return aware.astimezone(timezone.utc).replace(tzinfo=None)
 
 
 def _money(value: Any) -> float:
@@ -167,10 +210,16 @@ def resolve_period(
 ) -> tuple[datetime, datetime, datetime, datetime, str]:
     """
     Returns (period_start, period_end, prev_start, prev_end, label).
-    period_end is exclusive.
+
+    Bounds are naive **shop-local** datetimes. period_end is exclusive.
+
+    Open ranges (week / month / year) are to-date through end of today so
+    future appointments later this week/month are not counted as current
+    performance. Closed ranges (yesterday / last_month) cover the full span.
     """
-    now = now or datetime.utcnow()
+    now = now or datetime.now()
     today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    tomorrow = today + timedelta(days=1)
     key = (range_key or "today").strip().lower()
 
     if key == "custom" and from_raw and to_raw:
@@ -187,22 +236,22 @@ def resolve_period(
         return start, end, start - timedelta(days=1), start, "yesterday"
 
     if key in {"week", "this_week"}:
-        # Monday-based week
+        # Week-to-date (Monday → end of today); prior = same slice last week.
         start = today - timedelta(days=today.weekday())
-        end = start + timedelta(days=7)
-        return start, end, start - timedelta(days=7), start, "week"
+        end = tomorrow
+        return start, end, start - timedelta(days=7), end - timedelta(days=7), "week"
 
     if key in {"month", "this_month"}:
+        # Month-to-date; prior = same day-of-month span last month.
         start = today.replace(day=1)
-        if start.month == 12:
-            end = start.replace(year=start.year + 1, month=1)
-        else:
-            end = start.replace(month=start.month + 1)
-        prev_end = start
+        end = tomorrow
         if start.month == 1:
             prev_start = start.replace(year=start.year - 1, month=12)
         else:
             prev_start = start.replace(month=start.month - 1)
+        last_day = calendar.monthrange(prev_start.year, prev_start.month)[1]
+        prev_day = min(today.day, last_day)
+        prev_end = prev_start.replace(day=prev_day) + timedelta(days=1)
         return start, end, prev_start, prev_end, "month"
 
     if key == "last_month":
@@ -216,14 +265,16 @@ def resolve_period(
         return start, end, start - length, start, "last_month"
 
     if key == "year":
+        # Year-to-date; prior = same YTD last year.
         start = today.replace(month=1, day=1)
-        end = start.replace(year=start.year + 1)
+        end = tomorrow
         prev_start = start.replace(year=start.year - 1)
-        return start, end, prev_start, start, "year"
+        prev_end = end.replace(year=end.year - 1)
+        return start, end, prev_start, prev_end, "year"
 
     # today (default)
     start = today
-    end = today + timedelta(days=1)
+    end = tomorrow
     return start, end, start - timedelta(days=1), start, "today"
 
 
@@ -292,6 +343,7 @@ def _empty_insights_payload(
     goals: dict,
     employees: list[Employee],
     products: list[InventoryProduct],
+    timezone_name: str = _DEFAULT_TZ_NAME,
 ) -> dict:
     """Lightweight response for brand-new shops (no appts/clients/sales yet)."""
     shelf = _inventory_shelf_values(products)
@@ -363,9 +415,10 @@ def _empty_insights_payload(
     return {
         "period": {
             "range": label,
-            "from": start.isoformat() + "Z",
-            "to": (end - timedelta(microseconds=1)).isoformat() + "Z",
-            "from_exclusive_end": end.isoformat() + "Z",
+            "from": start.isoformat(),
+            "to": (end - timedelta(microseconds=1)).isoformat(),
+            "from_exclusive_end": end.isoformat(),
+            "timezone": timezone_name,
         },
         "meta": {
             "currency_note": (
@@ -375,7 +428,7 @@ def _empty_insights_payload(
                 "solo de servicios, no de productos."
             ),
             "unavailable": ["tips", "reviews"],
-            "generated_at": now.isoformat() + "Z",
+            "generated_at": utc_now_naive().isoformat() + "Z",
         },
         "snapshot": {
             "revenue": 0.0,
@@ -528,11 +581,22 @@ def build_insights(
     When employee_id is set (staff portal), metrics are scoped to that barber:
     their appointments and sales only. Shop-wide inventory is omitted.
     """
-    now = datetime.utcnow()
-    start, end, prev_start, prev_end, label = resolve_period(range_key, from_dt, to_dt, now)
+    business = Business.query.get(business_id)
+    tz = business_timezone(business)
+    now_local = local_now(tz)
+    now_utc = utc_now_naive()
+    # Appointments + period labels use shop-local calendar days.
+    start, end, prev_start, prev_end, label = resolve_period(
+        range_key, from_dt, to_dt, now_local
+    )
+    # Sales / movements are stored with utcnow(); convert local bounds.
+    utc_start = local_to_utc_naive(start, tz)
+    utc_end = local_to_utc_naive(end, tz)
+    utc_prev_start = local_to_utc_naive(prev_start, tz)
+    utc_prev_end = local_to_utc_naive(prev_end, tz)
+    now = now_local  # appointment comparisons & projections stay local
     staff_scope = employee_id is not None
 
-    business = Business.query.get(business_id)
     goals = parse_goals(getattr(business, "insights_goals_json", None) if business else None)
 
     services = ServiceType.query.filter_by(business_id=business_id).all()
@@ -584,11 +648,13 @@ def build_insights(
             goals=goals,
             employees=employees,
             products=products,
+            timezone_name=getattr(tz, "key", None) or str(tz),
         )
 
     # Always cover calendar month + hist window so goals/projections are not truncated
     # when the Insights range is "today" / a short custom range.
     month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    utc_month_start = local_to_utc_naive(month_start, tz)
     hist_floor = now - timedelta(days=32)
     load_from = min(prev_start - timedelta(days=1), month_start - timedelta(days=1), hist_floor)
 
@@ -699,14 +765,14 @@ def build_insights(
         sale_movements = InventoryMovement.query.filter(
             InventoryMovement.business_id == business_id,
             InventoryMovement.movement_type == "sale",
-            InventoryMovement.created_at >= start,
-            InventoryMovement.created_at < end,
+            InventoryMovement.created_at >= utc_start,
+            InventoryMovement.created_at < utc_end,
         ).all()
         prev_sale_movements = InventoryMovement.query.filter(
             InventoryMovement.business_id == business_id,
             InventoryMovement.movement_type == "sale",
-            InventoryMovement.created_at >= prev_start,
-            InventoryMovement.created_at < prev_end,
+            InventoryMovement.created_at >= utc_prev_start,
+            InventoryMovement.created_at < utc_prev_end,
         ).all()
     product_units_sold = sum(int(m.quantity or 0) for m in sale_movements)
     product_revenue = round(sum(float(m.total_revenue or 0) for m in sale_movements), 2)
@@ -725,8 +791,8 @@ def build_insights(
             Sale.business_id == business_id,
             Sale.status == "completed",
             SaleItem.item_type == "service",
-            Sale.created_at >= start,
-            Sale.created_at < end,
+            Sale.created_at >= utc_start,
+            Sale.created_at < utc_end,
         )
     )
     if staff_scope:
@@ -744,8 +810,8 @@ def build_insights(
             Sale.business_id == business_id,
             Sale.status == "completed",
             SaleItem.item_type == "service",
-            Sale.created_at >= prev_start,
-            Sale.created_at < prev_end,
+            Sale.created_at >= utc_prev_start,
+            Sale.created_at < utc_prev_end,
         )
     )
     if staff_scope:
@@ -757,14 +823,14 @@ def build_insights(
     period_sales_q = Sale.query.filter(
         Sale.business_id == business_id,
         Sale.status == "completed",
-        Sale.created_at >= start,
-        Sale.created_at < end,
+        Sale.created_at >= utc_start,
+        Sale.created_at < utc_end,
     )
     prev_sales_q = Sale.query.filter(
         Sale.business_id == business_id,
         Sale.status == "completed",
-        Sale.created_at >= prev_start,
-        Sale.created_at < prev_end,
+        Sale.created_at >= utc_prev_start,
+        Sale.created_at < utc_prev_end,
     )
     if staff_scope:
         period_sales_q = period_sales_q.filter(Sale.employee_id == employee_id)
@@ -877,32 +943,36 @@ def build_insights(
     }
 
     def ledger_revenue(bucket_start: datetime, bucket_end: datetime) -> float:
+        ua = local_to_utc_naive(bucket_start, tz)
+        ub = local_to_utc_naive(bucket_end, tz)
         pos = sum(
             float(item.line_total or 0)
             for item, sale in pos_service_rows
             if sale.created_at is not None
-            and bucket_start <= sale.created_at < bucket_end
+            and ua <= sale.created_at < ub
         )
         prods = sum(
             float(m.total_revenue or 0)
             for m in sale_movements
-            if m.created_at is not None and bucket_start <= m.created_at < bucket_end
+            if m.created_at is not None and ua <= m.created_at < ub
         )
         disc = sum(
             float(s.discount or 0)
             for s in period_sales
-            if s.created_at is not None and bucket_start <= s.created_at < bucket_end
+            if s.created_at is not None and ua <= s.created_at < ub
         )
         tax = sum(
             float(s.tax or 0)
             for s in period_sales
-            if s.created_at is not None and bucket_start <= s.created_at < bucket_end
+            if s.created_at is not None and ua <= s.created_at < ub
         )
         return pos + prods - disc + tax
 
     def bucket_ticket_avg(
         m: dict, bucket_start: datetime, bucket_end: datetime, rev: float
     ) -> float:
+        ua = local_to_utc_naive(bucket_start, tz)
+        ub = local_to_utc_naive(bucket_end, tz)
         legacy_n = sum(
             1
             for a in period_appts
@@ -914,7 +984,7 @@ def build_insights(
         sales_n = sum(
             1
             for s in period_sales
-            if s.created_at is not None and bucket_start <= s.created_at < bucket_end
+            if s.created_at is not None and ua <= s.created_at < ub
         )
         n = legacy_n + sales_n
         return round(rev / n, 2) if n else 0.0
@@ -1287,7 +1357,7 @@ def build_insights(
         if is_operating_supply(getattr(p, "item_kind", None))
     }
     supply_purchase_expense = _supply_purchase_expense(
-        business_id, start, end, supply_ids
+        business_id, utc_start, utc_end, supply_ids
     )
 
     sold_by_product: dict = defaultdict(lambda: {"units": 0, "revenue": 0.0, "name": ""})
@@ -1326,11 +1396,12 @@ def build_insights(
     sell_through = _pct(float(product_units_sold), float(product_units_sold + remaining_units))
 
     hist_product_start = now - timedelta(days=28)
+    utc_hist_product_start = local_to_utc_naive(hist_product_start, tz)
     hist_product_sales = InventoryMovement.query.filter(
         InventoryMovement.business_id == business_id,
         InventoryMovement.movement_type == "sale",
-        InventoryMovement.created_at >= hist_product_start,
-        InventoryMovement.created_at < now,
+        InventoryMovement.created_at >= utc_hist_product_start,
+        InventoryMovement.created_at < now_utc,
     ).all()
     hist_product_by_day: dict[str, float] = defaultdict(float)
     for m in hist_product_sales:
@@ -1377,6 +1448,7 @@ def build_insights(
         month_end = month_start.replace(year=month_start.year + 1, month=1)
     else:
         month_end = month_start.replace(month=month_start.month + 1)
+    utc_month_end = local_to_utc_naive(month_end, tz)
 
     month_legacy_rev = sum(
         _appt_price(a, price_map)
@@ -1396,8 +1468,8 @@ def build_insights(
                     Sale.business_id == business_id,
                     Sale.status == "completed",
                     SaleItem.item_type == "service",
-                    Sale.created_at >= month_start,
-                    Sale.created_at < now,
+                    Sale.created_at >= utc_month_start,
+                    Sale.created_at < now_utc,
                 )
                 .all()
             )
@@ -1410,8 +1482,8 @@ def build_insights(
             for m in InventoryMovement.query.filter(
                 InventoryMovement.business_id == business_id,
                 InventoryMovement.movement_type == "sale",
-                InventoryMovement.created_at >= month_start,
-                InventoryMovement.created_at < now,
+                InventoryMovement.created_at >= utc_month_start,
+                InventoryMovement.created_at < now_utc,
             ).all()
         ),
         2,
@@ -1419,8 +1491,8 @@ def build_insights(
     month_sales_headers = Sale.query.filter(
         Sale.business_id == business_id,
         Sale.status == "completed",
-        Sale.created_at >= month_start,
-        Sale.created_at < now,
+        Sale.created_at >= utc_month_start,
+        Sale.created_at < now_utc,
     ).all()
     month_discount = round(sum(float(s.discount or 0) for s in month_sales_headers), 2)
     month_tax = round(sum(float(s.tax or 0) for s in month_sales_headers), 2)
@@ -1458,11 +1530,13 @@ def build_insights(
             2,
         )
 
-    today_end = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
-    week_end = today_end + timedelta(days=6)
-    today_start = today_end - timedelta(days=1)
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    today_end = today_start + timedelta(days=1)
+    week_end = today_start - timedelta(days=today_start.weekday()) + timedelta(days=7)
 
     def realized_revenue(a0: datetime, a1: datetime) -> float:
+        ua = local_to_utc_naive(a0, tz)
+        ub = local_to_utc_naive(a1, tz)
         legacy = sum(
             _appt_price(a, price_map)
             for a in appts
@@ -1479,8 +1553,8 @@ def build_insights(
                     Sale.business_id == business_id,
                     Sale.status == "completed",
                     SaleItem.item_type == "service",
-                    Sale.created_at >= a0,
-                    Sale.created_at < a1,
+                    Sale.created_at >= ua,
+                    Sale.created_at < ub,
                 )
                 .all()
             )
@@ -1490,15 +1564,15 @@ def build_insights(
             for m in InventoryMovement.query.filter(
                 InventoryMovement.business_id == business_id,
                 InventoryMovement.movement_type == "sale",
-                InventoryMovement.created_at >= a0,
-                InventoryMovement.created_at < a1,
+                InventoryMovement.created_at >= ua,
+                InventoryMovement.created_at < ub,
             ).all()
         )
         sales = Sale.query.filter(
             Sale.business_id == business_id,
             Sale.status == "completed",
-            Sale.created_at >= a0,
-            Sale.created_at < a1,
+            Sale.created_at >= ua,
+            Sale.created_at < ub,
         ).all()
         disc = sum(float(s.discount or 0) for s in sales)
         tax = sum(float(s.tax or 0) for s in sales)
@@ -1506,6 +1580,7 @@ def build_insights(
 
     # Historical average daily revenue (last 28 completed days) — combined definition
     hist_start = now - timedelta(days=28)
+    utc_hist_start = local_to_utc_naive(hist_start, tz)
     hist_by_day: dict[str, float] = defaultdict(float)
     for a in appts:
         if (
@@ -1522,31 +1597,46 @@ def build_insights(
             Sale.business_id == business_id,
             Sale.status == "completed",
             SaleItem.item_type == "service",
-            Sale.created_at >= hist_start,
-            Sale.created_at < now,
+            Sale.created_at >= utc_hist_start,
+            Sale.created_at < now_utc,
         )
         .all()
     ):
         if sale.created_at:
-            hist_by_day[sale.created_at.strftime("%Y-%m-%d")] += float(item.line_total or 0)
+            # Bucket by shop-local calendar day.
+            local_day = (
+                sale.created_at.replace(tzinfo=timezone.utc)
+                .astimezone(tz)
+                .strftime("%Y-%m-%d")
+            )
+            hist_by_day[local_day] += float(item.line_total or 0)
     for m in InventoryMovement.query.filter(
         InventoryMovement.business_id == business_id,
         InventoryMovement.movement_type == "sale",
-        InventoryMovement.created_at >= hist_start,
-        InventoryMovement.created_at < now,
+        InventoryMovement.created_at >= utc_hist_start,
+        InventoryMovement.created_at < now_utc,
     ).all():
         if m.created_at:
-            hist_by_day[m.created_at.strftime("%Y-%m-%d")] += float(m.total_revenue or 0)
+            local_day = (
+                m.created_at.replace(tzinfo=timezone.utc)
+                .astimezone(tz)
+                .strftime("%Y-%m-%d")
+            )
+            hist_by_day[local_day] += float(m.total_revenue or 0)
     for s in Sale.query.filter(
         Sale.business_id == business_id,
         Sale.status == "completed",
-        Sale.created_at >= hist_start,
-        Sale.created_at < now,
+        Sale.created_at >= utc_hist_start,
+        Sale.created_at < now_utc,
     ).all():
         if s.created_at:
-            day = s.created_at.strftime("%Y-%m-%d")
-            hist_by_day[day] -= float(s.discount or 0)
-            hist_by_day[day] += float(s.tax or 0)
+            local_day = (
+                s.created_at.replace(tzinfo=timezone.utc)
+                .astimezone(tz)
+                .strftime("%Y-%m-%d")
+            )
+            hist_by_day[local_day] -= float(s.discount or 0)
+            hist_by_day[local_day] += float(s.tax or 0)
 
     hist_avg = (
         sum(hist_by_day.values()) / max(1, len(hist_by_day)) if hist_by_day else daily_pace
@@ -1585,8 +1675,8 @@ def build_insights(
             for m in InventoryMovement.query.filter(
                 InventoryMovement.business_id == business_id,
                 InventoryMovement.movement_type == "sale",
-                InventoryMovement.created_at >= month_start,
-                InventoryMovement.created_at < month_end,
+                InventoryMovement.created_at >= utc_month_start,
+                InventoryMovement.created_at < utc_month_end,
             ).all()
         ),
         2,
@@ -1767,9 +1857,10 @@ def build_insights(
     return {
         "period": {
             "range": label,
-            "from": start.isoformat() + "Z",
-            "to": (end - timedelta(microseconds=1)).isoformat() + "Z",
-            "from_exclusive_end": end.isoformat() + "Z",
+            "from": start.isoformat(),
+            "to": (end - timedelta(microseconds=1)).isoformat(),
+            "from_exclusive_end": end.isoformat(),
+            "timezone": getattr(tz, "key", None) or str(tz),
         },
         "meta": {
             "currency_note": (
@@ -1779,7 +1870,7 @@ def build_insights(
                 "solo de servicios, no de productos."
             ),
             "unavailable": ["tips", "reviews"],
-            "generated_at": now.isoformat() + "Z",
+            "generated_at": now_utc.isoformat() + "Z",
         },
         "snapshot": snapshot,
         "payment_methods": payment_methods,

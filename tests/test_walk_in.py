@@ -99,6 +99,23 @@ def test_walk_in_creates_completed_sale_and_reuses_customer(app, client):
         assert row.email == "carlos@test.com"
         assert "Pérez" in (row.last_name or "")
 
+        # Sub-hour start times are kept (not forced to :00).
+        fine = datetime(2026, 8, 12, 15, 20, 0)
+        res3 = client.post(
+            "/api/shop/appointments/walk-in",
+            json={
+                "name": "Nuevo",
+                "phone": "70001111",
+                "service_type_id": str(bundle["service"].id),
+                "employee_id": str(bundle["employee"].id),
+                "payment_method": "cash",
+                "start_time": fine.isoformat(),
+            },
+            headers=headers,
+        )
+        assert res3.status_code == 201, res3.get_data(as_text=True)
+        assert "15:20" in (res3.get_json()["start_time"] or "")
+
 
 def test_walk_in_without_phone_creates_distinct_customers(app, client):
     with app.app_context():

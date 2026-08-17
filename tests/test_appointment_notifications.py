@@ -200,7 +200,7 @@ class TestPublicBookingIntegration:
     ):
         bundle = create_tenant_bundle()
         start = datetime.now().replace(second=0, microsecond=0) + timedelta(days=2)
-        start = start.replace(minute=(start.minute // 15) * 15)
+        start = start.replace(minute=0, second=0, microsecond=0)
         end = start + timedelta(minutes=30)
 
         with app.app_context():
