@@ -15,6 +15,7 @@ from typing import Any
 from flask import Blueprint, jsonify, request
 from flask_jwt_extended import create_access_token, verify_jwt_in_request
 from sqlalchemy import and_, func, or_, text
+from sqlalchemy.orm import joinedload
 from werkzeug.security import check_password_hash, generate_password_hash
 
 from app.customer_auth import CUSTOMER_ROLE, get_customer_context
@@ -375,50 +376,28 @@ def _public_business_dict(b: Business) -> dict[str, Any]:
     }
 
 
-@public_booking.route("/booking/<slug>", methods=["GET"])
-def get_public_business(slug: str):
-    b = _get_business_by_slug(slug)
-    if not b or not b.is_active:
-        return _json_error("Barbería no encontrada.", 404)
-    return jsonify(_public_business_dict(b)), 200
-
-
-@public_booking.route("/booking/<slug>/services", methods=["GET"])
-def list_public_services(slug: str):
-    b = _get_business_by_slug(slug)
-    if not b or not b.is_active:
-        return _json_error("Barbería no encontrada.", 404)
+def _public_services_list(b: Business) -> list[dict[str, Any]]:
     items = (
         ServiceType.query.filter_by(business_id=b.id, is_active=True)
         .order_by(ServiceType.name)
         .all()
     )
-    return (
-        jsonify(
-            {
-                "items": [
-                    {
-                        "id": str(s.id),
-                        "name": s.name,
-                        "description": s.description,
-                        "duration": s.duration,
-                        "price": float(s.price),
-                    }
-                    for s in items
-                ]
-            }
-        ),
-        200,
-    )
+    return [
+        {
+            "id": str(s.id),
+            "name": s.name,
+            "description": s.description,
+            "duration": s.duration,
+            "price": float(s.price),
+        }
+        for s in items
+    ]
 
 
-@public_booking.route("/booking/<slug>/barbers", methods=["GET"])
-def list_public_barbers(slug: str):
-    b = _get_business_by_slug(slug)
-    if not b or not b.is_active:
-        return _json_error("Barbería no encontrada.", 404)
+def _public_barbers_list(b: Business) -> list[dict[str, Any]]:
     emps = (
         Employee.query.filter_by(business_id=b.id, is_active=True)
+        .options(joinedload(Employee.user))
         .order_by(Employee.id)
         .all()
     )
@@ -433,7 +412,48 @@ def list_public_barbers(slug: str):
                 "email": u.email if u else None,
             }
         )
-    return jsonify({"items": items}), 200
+    return items
+
+
+@public_booking.route("/booking/<slug>/bootstrap", methods=["GET"])
+def get_public_bootstrap(slug: str):
+    b = _get_business_by_slug(slug)
+    if not b or not b.is_active:
+        return _json_error("Barbería no encontrada.", 404)
+    return (
+        jsonify(
+            {
+                "business": _public_business_dict(b),
+                "services": _public_services_list(b),
+                "barbers": _public_barbers_list(b),
+            }
+        ),
+        200,
+    )
+
+
+@public_booking.route("/booking/<slug>", methods=["GET"])
+def get_public_business(slug: str):
+    b = _get_business_by_slug(slug)
+    if not b or not b.is_active:
+        return _json_error("Barbería no encontrada.", 404)
+    return jsonify(_public_business_dict(b)), 200
+
+
+@public_booking.route("/booking/<slug>/services", methods=["GET"])
+def list_public_services(slug: str):
+    b = _get_business_by_slug(slug)
+    if not b or not b.is_active:
+        return _json_error("Barbería no encontrada.", 404)
+    return jsonify({"items": _public_services_list(b)}), 200
+
+
+@public_booking.route("/booking/<slug>/barbers", methods=["GET"])
+def list_public_barbers(slug: str):
+    b = _get_business_by_slug(slug)
+    if not b or not b.is_active:
+        return _json_error("Barbería no encontrada.", 404)
+    return jsonify({"items": _public_barbers_list(b)}), 200
 
 
 @public_booking.route("/booking/<slug>/availability", methods=["GET"])
