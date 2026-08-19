@@ -2015,8 +2015,6 @@ def update_settings(ctx: ShopContext):
         if not v:
             return _json_error("phone vacío.", 400)
         b.phone = v
-    if "logo_url" in payload:
-        b.logo_url = (payload.get("logo_url") or "").strip() or None
     if "business_hours_json" in payload:
         normalized, hours_err = _normalize_business_hours_json(
             payload.get("business_hours_json")

@@ -1,8 +1,9 @@
-"""Save / remove business logo files under the uploads directory."""
+"""Save / remove business logo files (local disk or Cloudinary)."""
 
 from __future__ import annotations
 
 import io
+import os
 import uuid
 from pathlib import Path
 from uuid import UUID
@@ -20,6 +21,38 @@ class LogoError(Exception):
         super().__init__(message)
         self.message = message
         self.status_code = status_code
+
+
+def cloudinary_configured() -> bool:
+    if (os.getenv("CLOUDINARY_URL") or "").strip():
+        return True
+    return all(
+        (os.getenv(name) or "").strip()
+        for name in (
+            "CLOUDINARY_CLOUD_NAME",
+            "CLOUDINARY_API_KEY",
+            "CLOUDINARY_API_SECRET",
+        )
+    )
+
+
+def _init_cloudinary() -> None:
+    import cloudinary
+
+    url = (os.getenv("CLOUDINARY_URL") or "").strip()
+    if url:
+        cloudinary.config(cloudinary_url=url, secure=True)
+        return
+    cloudinary.config(
+        cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME"),
+        api_key=os.getenv("CLOUDINARY_API_KEY"),
+        api_secret=os.getenv("CLOUDINARY_API_SECRET"),
+        secure=True,
+    )
+
+
+def logo_public_id(business_id: UUID) -> str:
+    return f"barber-logos/{business_id}/logo"
 
 
 def uploads_root() -> Path:
@@ -57,10 +90,42 @@ def clear_business_logo_files(business_id: UUID) -> None:
                 pass
 
 
+def _delete_cloudinary_logo(business_id: UUID) -> None:
+    if not cloudinary_configured():
+        return
+    _init_cloudinary()
+    import cloudinary.uploader
+
+    try:
+        cloudinary.uploader.destroy(logo_public_id(business_id), invalidate=True)
+    except Exception:
+        pass
+
+
+def _save_cloudinary_logo(business_id: UUID, data: bytes, ext: str) -> str:
+    _init_cloudinary()
+    import cloudinary.uploader
+
+    clear_business_logo_files(business_id)
+    _delete_cloudinary_logo(business_id)
+
+    result = cloudinary.uploader.upload(
+        data,
+        public_id=logo_public_id(business_id),
+        overwrite=True,
+        resource_type="image",
+        format=ext,
+    )
+    token = uuid.uuid4().hex[:8]
+    return f"{result['secure_url']}?v={token}"
+
+
 def save_business_logo(business_id: UUID, file: FileStorage) -> str:
     """
-    Persist an uploaded logo and return the public path
-    (e.g. ``/uploads/logos/<business_id>/logo.png``).
+    Persist an uploaded logo and return a public URL or path.
+
+    Uses Cloudinary when ``CLOUDINARY_URL`` (or cloud name/key/secret) is set;
+    otherwise writes under ``UPLOAD_FOLDER`` (ephemeral on Render unless mounted).
     """
     if file is None or not getattr(file, "filename", None):
         raise LogoError("Selecciona un archivo de imagen.")
@@ -72,29 +137,30 @@ def save_business_logo(business_id: UUID, file: FileStorage) -> str:
             400,
         )
 
-    # Read once to enforce size (FileStorage may not expose content_length).
     data = file.read()
     if not data:
         raise LogoError("El archivo está vacío.")
     if len(data) > MAX_LOGO_BYTES:
         raise LogoError("El logo no puede superar 2 MB.", 400)
 
+    if cloudinary_configured():
+        return _save_cloudinary_logo(business_id, data, ext)
+
     clear_business_logo_files(business_id)
     dest = business_logo_dir(business_id) / f"logo.{ext}"
     dest.write_bytes(data)
 
-    # Cache-bust query so clients refresh after replace.
     token = uuid.uuid4().hex[:8]
     return f"/uploads/logos/{business_id}/logo.{ext}?v={token}"
 
 
 def delete_business_logo(business_id: UUID) -> None:
+    _delete_cloudinary_logo(business_id)
     clear_business_logo_files(business_id)
 
 
 def minimal_png_bytes() -> bytes:
     """1×1 PNG for tests."""
-    # Pre-built tiny PNG
     return (
         b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
         b"\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\x0cIDATx\x9cc\xf8\x0f"
