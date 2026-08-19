@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 
 from flask import Blueprint, jsonify, request
@@ -162,18 +162,22 @@ def _parse_uuid(value):
 
 
 def _parse_dt(value):
-    """Parse ISO datetimes to naive UTC (matches columns filled with utcnow())."""
+    """Parse ISO datetimes to naive local wall-clock (shop appointment convention)."""
     if value is None or value == "":
         return None
     if isinstance(value, datetime):
-        if value.tzinfo is not None:
-            return value.astimezone(timezone.utc).replace(tzinfo=None)
-        return value
+        return value.replace(tzinfo=None) if value.tzinfo else value
     try:
-        s = str(value).replace("Z", "+00:00")
-        parsed = datetime.fromisoformat(s)
+        s = str(value).strip()
+        # Prefer naive local strings from shop UI / public booking.
+        if s.endswith(("Z", "z")):
+            bare = s[:-1]
+            if "." in bare:
+                bare = bare.split(".", 1)[0]
+            return datetime.fromisoformat(bare)
+        parsed = datetime.fromisoformat(s.replace("Z", "+00:00"))
         if parsed.tzinfo is not None:
-            return parsed.astimezone(timezone.utc).replace(tzinfo=None)
+            return parsed.replace(tzinfo=None)
         return parsed
     except ValueError:
         return None
