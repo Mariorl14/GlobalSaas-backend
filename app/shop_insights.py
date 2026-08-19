@@ -1844,15 +1844,13 @@ def build_insights(
             "Agenda más citas y completa servicios para desbloquear insights de crecimiento."
         )
 
-    upcoming = (
-        Appointment.query.filter(
-            Appointment.business_id == business_id,
-            Appointment.start_time >= now,
-        )
-        .order_by(Appointment.start_time.asc())
-        .limit(6)
-        .all()
+    upcoming_q = Appointment.query.filter(
+        Appointment.business_id == business_id,
+        Appointment.start_time >= now,
     )
+    if employee_id:
+        upcoming_q = upcoming_q.filter(Appointment.employee_id == employee_id)
+    upcoming = upcoming_q.order_by(Appointment.start_time.asc()).limit(6).all()
 
     return {
         "period": {
@@ -1889,9 +1887,14 @@ def build_insights(
             {
                 "id": str(a.id),
                 "client_name": a.client_name,
+                "client_email": a.client_email,
                 "start_time": a.start_time.isoformat() if a.start_time else None,
+                "end_time": a.end_time.isoformat() if a.end_time else None,
                 "status": _status_norm(a.status),
+                "service_type_id": str(a.service_type_id),
                 "service_name": name_map.get(a.service_type_id),
+                "employee_id": str(a.employee_id),
+                "employee_name": emp_name.get(a.employee_id),
             }
             for a in upcoming
         ],
