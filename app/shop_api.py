@@ -41,7 +41,7 @@ from app.appointment_lifecycle import (
     clear_reschedule_fields,
     propose_reschedule,
 )
-from app.shop_insights import build_insights, parse_goals, serialize_goals
+from app.shop_datetime import parse_shop_local_dt
 from app.inventory_movements import (
     InventoryMovementError,
     apply_stock_correction_if_needed,
@@ -162,20 +162,13 @@ def _parse_uuid(value):
 
 
 def _parse_dt(value):
-    """Parse ISO datetimes to naive local wall-clock (shop appointment convention)."""
+    """Parse naive datetimes for UTC-stored records (sales, inventory)."""
     if value is None or value == "":
         return None
     if isinstance(value, datetime):
         return value.replace(tzinfo=None) if value.tzinfo else value
     try:
-        s = str(value).strip()
-        # Prefer naive local strings from shop UI / public booking.
-        if s.endswith(("Z", "z")):
-            bare = s[:-1]
-            if "." in bare:
-                bare = bare.split(".", 1)[0]
-            return datetime.fromisoformat(bare)
-        parsed = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
         if parsed.tzinfo is not None:
             return parsed.replace(tzinfo=None)
         return parsed
@@ -516,8 +509,8 @@ def shop_dashboard(ctx: ShopContext):
 def shop_insights(ctx: ShopContext):
     """Business Intelligence snapshot for the tenant portal Insights page."""
     range_key = (request.args.get("range") or "today").strip().lower()
-    from_dt = _parse_dt(request.args.get("from"))
-    to_dt = _parse_dt(request.args.get("to"))
+    from_dt = parse_shop_local_dt(request.args.get("from"), ctx.business_id)
+    to_dt = parse_shop_local_dt(request.args.get("to"), ctx.business_id)
     # Staff only see their own performance metrics.
     scope_employee_id = ctx.employee_id if ctx.is_staff else None
     try:
@@ -578,8 +571,8 @@ def shop_insights_goals(ctx: ShopContext):
 def list_appointments(ctx: ShopContext):
     q = Appointment.query.filter_by(business_id=ctx.business_id)
 
-    df = _parse_dt(request.args.get("from"))
-    dt = _parse_dt(request.args.get("to"))
+    df = parse_shop_local_dt(request.args.get("from"), ctx.business_id)
+    dt = parse_shop_local_dt(request.args.get("to"), ctx.business_id)
     if df:
         q = q.filter(Appointment.start_time >= df)
     if dt:
@@ -622,8 +615,8 @@ def create_appointment(ctx: ShopContext):
     cid = _parse_uuid(payload.get("client_id"))
     sid = _parse_uuid(payload.get("service_type_id"))
     eid = _parse_uuid(payload.get("employee_id"))
-    start = _parse_dt(payload.get("start_time"))
-    end = _parse_dt(payload.get("end_time"))
+    start = parse_shop_local_dt(payload.get("start_time"), ctx.business_id)
+    end = parse_shop_local_dt(payload.get("end_time"), ctx.business_id)
     # Staff can only book / assign appointments to themselves.
     if ctx.is_staff:
         if not ctx.employee_id:
@@ -789,7 +782,7 @@ def create_walk_in(ctx: ShopContext):
     duration = int(st.duration or 30)
     if duration <= 0:
         duration = 30
-    start = _parse_dt(payload.get("start_time"))
+    start = parse_shop_local_dt(payload.get("start_time"), ctx.business_id)
     if not start:
         return _json_error("El día y la hora atendida son obligatorios.", 400)
     start = start.replace(second=0, microsecond=0)
@@ -899,13 +892,13 @@ def update_appointment(ctx: ShopContext, appointment_id: str):
 
     times_changed = False
     if "start_time" in payload:
-        t = _parse_dt(payload.get("start_time"))
+        t = parse_shop_local_dt(payload.get("start_time"), ctx.business_id)
         if not t:
             return _json_error("start_time inválido.", 400)
         a.start_time = t
         times_changed = True
     if "end_time" in payload:
-        t = _parse_dt(payload.get("end_time"))
+        t = parse_shop_local_dt(payload.get("end_time"), ctx.business_id)
         if not t:
             return _json_error("end_time inválido.", 400)
         a.end_time = t
@@ -955,8 +948,12 @@ def propose_appointment_reschedule(ctx: ShopContext, appointment_id: str):
         return _json_error("Cita no encontrada.", 404)
 
     payload = request.get_json(silent=True) or {}
-    new_start = _parse_dt(payload.get("start_time") or payload.get("proposed_start_time"))
-    new_end = _parse_dt(payload.get("end_time") or payload.get("proposed_end_time"))
+    new_start = parse_shop_local_dt(
+        payload.get("start_time") or payload.get("proposed_start_time"), ctx.business_id
+    )
+    new_end = parse_shop_local_dt(
+        payload.get("end_time") or payload.get("proposed_end_time"), ctx.business_id
+    )
     if not new_start:
         return _json_error("start_time inválido.", 400)
     send_email = payload.get("send_email", True)
