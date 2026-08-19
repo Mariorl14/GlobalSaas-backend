@@ -42,6 +42,7 @@ from app.appointment_lifecycle import (
     propose_reschedule,
 )
 from app.shop_datetime import parse_shop_local_dt
+from app.shop_insights import build_insights, parse_goals, serialize_goals
 from app.inventory_movements import (
     InventoryMovementError,
     apply_stock_correction_if_needed,
