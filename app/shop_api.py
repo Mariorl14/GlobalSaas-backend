@@ -1919,7 +1919,7 @@ def _staff_row(emp: Employee) -> dict:
 @shop_jwt_required
 def list_staff(ctx: ShopContext):
     rows = (
-        Employee.query.filter_by(business_id=ctx.business_id)
+        Employee.query.filter_by(business_id=ctx.business_id, is_active=True)
         .order_by(Employee.id)
         .all()
     )
