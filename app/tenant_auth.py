@@ -33,6 +33,10 @@ class ShopContext(NamedTuple):
     def is_staff(self) -> bool:
         return self.role == SHOP_STAFF_ROLE
 
+    @property
+    def is_owner(self) -> bool:
+        return self.role == "owner"
+
 
 def get_shop_context() -> Tuple[Optional[ShopContext], Optional[Tuple]]:
     """
@@ -110,3 +114,24 @@ def shop_admin_required(fn: F) -> F:
 def shop_manager_required(fn: F) -> F:
     """Alias for shop_admin_required (owner + admin)."""
     return shop_admin_required(fn)
+
+
+def shop_owner_required(fn: F) -> F:
+    """Shop owner only (cancel/delete appointments, etc.)."""
+
+    @wraps(fn)
+    @jwt_required()
+    def decorated(*args, **kwargs):
+        if request.method == "OPTIONS":
+            return "", 200
+        ctx, err = get_shop_context()
+        if err is not None:
+            return err[0], err[1]
+        if not ctx.is_owner:
+            return (
+                jsonify({"error": "Solo el propietario del negocio puede hacer esto."}),
+                403,
+            )
+        return fn(ctx, *args, **kwargs)
+
+    return decorated  # type: ignore[return-value]

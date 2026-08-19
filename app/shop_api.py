@@ -23,6 +23,7 @@ from app.models import (
     Client,
     Employee,
     InventoryProduct,
+    NotificationLog,
     ServiceType,
     User,
 )
@@ -911,6 +912,10 @@ def update_appointment(ctx: ShopContext, appointment_id: str):
             a.status = "scheduled"
     if "status" in payload:
         new_status = _normalize_appointment_status(payload.get("status"))
+        if new_status == "canceled" and ctx.is_staff:
+            return _json_error(
+                "Solo el propietario o administrador puede cancelar citas.", 403
+            )
         becoming_completed = (
             new_status == "completed" and prev_status != "completed"
         )
@@ -983,7 +988,7 @@ def propose_appointment_reschedule(ctx: ShopContext, appointment_id: str):
 
 
 @shop_api.route("/appointments/<appointment_id>/cancel", methods=["POST"])
-@shop_jwt_required
+@shop_admin_required
 def cancel_shop_appointment(ctx: ShopContext, appointment_id: str):
     aid = _parse_uuid(appointment_id)
     if not aid:
@@ -1025,7 +1030,7 @@ def cancel_shop_appointment(ctx: ShopContext, appointment_id: str):
 
 
 @shop_api.route("/appointments/<appointment_id>", methods=["DELETE"])
-@shop_jwt_required
+@shop_admin_required
 def delete_appointment(ctx: ShopContext, appointment_id: str):
     aid = _parse_uuid(appointment_id)
     if not aid:
@@ -1033,11 +1038,15 @@ def delete_appointment(ctx: ShopContext, appointment_id: str):
     a = Appointment.query.filter_by(id=aid, business_id=ctx.business_id).first()
     if not a:
         return _json_error("Cita no encontrada.", 404)
-    if ctx.is_staff:
-        if not ctx.employee_id or a.employee_id != ctx.employee_id:
-            return _json_error("Solo puedes eliminar tus propias citas.", 403)
     client = Client.query.get(a.client_id)
     try:
+        NotificationLog.query.filter_by(appointment_id=a.id).delete(
+            synchronize_session=False
+        )
+        InventoryMovement.query.filter_by(appointment_id=a.id).update(
+            {InventoryMovement.appointment_id: None},
+            synchronize_session=False,
+        )
         db.session.delete(a)
         if client and (client.appointments_amount or 0) > 0:
             client.appointments_amount -= 1
