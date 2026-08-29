@@ -2,11 +2,23 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from uuid import UUID
 
 from app.models import Business
-from app.shop_insights import business_timezone
+from app.shop_insights import business_timezone, local_now
+
+
+def shop_local_now(business: Business | None) -> datetime:
+    """Naive wall-clock now in the shop timezone (same convention as appointment times)."""
+    try:
+        return local_now(business_timezone(business))
+    except Exception:
+        return datetime.now().replace(microsecond=0)
+
+
+def shop_local_today(business: Business | None) -> date:
+    return shop_local_now(business).date()
 
 
 def parse_shop_local_dt(value, business_id: UUID | None = None) -> datetime | None:

@@ -23,6 +23,7 @@ from app.extensions import db
 from app.models import Appointment, Business, Client, Employee, ServiceType
 from app.appointment_notifications import notify_appointment_created
 from app.name_utils import staff_display_label
+from app.shop_datetime import shop_local_now, shop_local_today
 
 public_booking = Blueprint("public_booking", __name__, url_prefix="/api/public")
 
@@ -244,7 +245,7 @@ def _open_intervals_for_employee(
 
 
 def _day_window_local(d: date) -> tuple[datetime, datetime]:
-    """Naive local day bounds (server-local calendar day)."""
+    """Naive shop-local day bounds (appointment times are stored as local wall-clock)."""
     start = datetime.combine(d, time.min)
     end = start + timedelta(days=1)
     return start, end
@@ -318,6 +319,7 @@ def _iter_slots_for_employee(
     employee_id: uuid.UUID,
     d: date,
     duration_min: int,
+    now: datetime | None = None,
 ) -> list[tuple[datetime, datetime]]:
     emp = Employee.query.filter_by(
         id=employee_id, business_id=business.id, is_active=True
@@ -332,8 +334,8 @@ def _iter_slots_for_employee(
     step = timedelta(minutes=SLOT_STEP_MINUTES)
     duration = timedelta(minutes=duration_min)
     slots: list[tuple[datetime, datetime]] = []
-    now = datetime.now()
-    today = date.today()
+    shop_now = now if now is not None else shop_local_now(business)
+    today = shop_now.date()
 
     for open_t, close_t in intervals:
         open_dt = datetime.combine(d, open_t)
@@ -345,7 +347,7 @@ def _iter_slots_for_employee(
             if t.minute not in SLOT_ALLOWED_MINUTES:
                 t += step
                 continue
-            if d == today and t < now:
+            if d == today and t < shop_now:
                 t += step
                 continue
             end = t + duration
@@ -570,10 +572,11 @@ def calendar_hints(slug: str):
 
     _, last_day = monthrange(year, month)
     days: dict[str, bool] = {}
+    today = shop_local_today(b)
 
     for day_n in range(1, last_day + 1):
         d = date(year, month, day_n)
-        if d < date.today():
+        if d < today:
             days[d.isoformat()] = False
             continue
         count = 0
