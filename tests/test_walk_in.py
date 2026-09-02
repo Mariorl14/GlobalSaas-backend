@@ -78,7 +78,8 @@ def test_walk_in_creates_completed_sale_and_reuses_customer(app, client):
         assert insights["snapshot"]["service_revenue"] == float(bundle["service"].price)
         assert insights["snapshot"]["revenue"] == float(bundle["service"].price)
 
-        # Returning customer with same phone is reused.
+        # Returning customer with same phone is reused (different slot — same barber
+        # cannot occupy the same clock time twice).
         res2 = client.post(
             "/api/shop/appointments/walk-in",
             json={
@@ -88,7 +89,7 @@ def test_walk_in_creates_completed_sale_and_reuses_customer(app, client):
                 "service_type_id": str(bundle["service"].id),
                 "employee_id": str(bundle["employee"].id),
                 "payment_method": "cash",
-                "start_time": start.isoformat(),
+                "start_time": datetime(2026, 8, 12, 16, 0, 0).isoformat(),
             },
             headers=headers,
         )
@@ -100,7 +101,7 @@ def test_walk_in_creates_completed_sale_and_reuses_customer(app, client):
         assert "Pérez" in (row.last_name or "")
 
         # Sub-hour start times are kept (not forced to :00).
-        fine = datetime(2026, 8, 12, 15, 20, 0)
+        fine = datetime(2026, 8, 12, 17, 20, 0)
         res3 = client.post(
             "/api/shop/appointments/walk-in",
             json={
@@ -114,7 +115,7 @@ def test_walk_in_creates_completed_sale_and_reuses_customer(app, client):
             headers=headers,
         )
         assert res3.status_code == 201, res3.get_data(as_text=True)
-        assert "15:20" in (res3.get_json()["start_time"] or "")
+        assert "17:20" in (res3.get_json()["start_time"] or "")
 
 
 def test_walk_in_without_phone_creates_distinct_customers(app, client):
@@ -144,7 +145,11 @@ def test_walk_in_without_phone_creates_distinct_customers(app, client):
         first = res.get_json()
         assert first["client_phone"] is None
 
-        res2 = client.post("/api/shop/appointments/walk-in", json=payload, headers=headers)
+        res2 = client.post(
+            "/api/shop/appointments/walk-in",
+            json={**payload, "start_time": datetime(2026, 8, 12, 16, 0, 0).isoformat()},
+            headers=headers,
+        )
         assert res2.status_code == 201, res2.get_data(as_text=True)
         second = res2.get_json()
         assert second["client_id"] != first["client_id"]

@@ -47,6 +47,34 @@ def _json_error(message: str, status_code: int = 400):
     return jsonify({"error": message}), status_code
 
 
+def _json_no_store(payload: dict[str, Any], status_code: int = 200):
+    """Availability must not be cached or two customers can pick the same barber slot."""
+    resp = jsonify(payload)
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+    resp.headers["Pragma"] = "no-cache"
+    return resp, status_code
+
+
+def _naive_dt(value: Any) -> datetime | None:
+    """Wall-clock datetime for overlap checks (naive, second precision)."""
+    if value is None:
+        return None
+    dt: datetime
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        try:
+            s = str(value).strip().replace("Z", "+00:00").replace("z", "+00:00")
+            if " " in s and "T" not in s[:19]:
+                s = s.replace(" ", "T", 1)
+            dt = datetime.fromisoformat(s)
+        except ValueError:
+            return None
+    if dt.tzinfo is not None:
+        dt = dt.replace(tzinfo=None)
+    return dt.replace(microsecond=0)
+
+
 def _parse_uuid(value):
     if value is None:
         return None
@@ -282,14 +310,18 @@ def _busy_intervals(
     blocks: list[tuple[datetime, datetime]] = []
     for a in rows:
         if a.start_time and a.end_time and a.start_time < day_end and a.end_time > day_start:
-            blocks.append((a.start_time, a.end_time))
+            ns, ne = _naive_dt(a.start_time), _naive_dt(a.end_time)
+            if ns and ne:
+                blocks.append((ns, ne))
         if (
             a.proposed_start_time
             and a.proposed_end_time
             and a.proposed_start_time < day_end
             and a.proposed_end_time > day_start
         ):
-            blocks.append((a.proposed_start_time, a.proposed_end_time))
+            ps, pe = _naive_dt(a.proposed_start_time), _naive_dt(a.proposed_end_time)
+            if ps and pe:
+                blocks.append((ps, pe))
     return blocks
 
 
@@ -322,21 +354,30 @@ def _busy_blocks_for_employees(
             continue
         blocks = out.setdefault(eid, [])
         if a.start_time and a.end_time and a.start_time < range_end and a.end_time > range_start:
-            blocks.append((a.start_time, a.end_time))
+            ns, ne = _naive_dt(a.start_time), _naive_dt(a.end_time)
+            if ns and ne:
+                blocks.append((ns, ne))
         if (
             a.proposed_start_time
             and a.proposed_end_time
             and a.proposed_start_time < range_end
             and a.proposed_end_time > range_start
         ):
-            blocks.append((a.proposed_start_time, a.proposed_end_time))
+            ps, pe = _naive_dt(a.proposed_start_time), _naive_dt(a.proposed_end_time)
+            if ps and pe:
+                blocks.append((ps, pe))
     return out
 
 
 def _busy_on_day(
     blocks: list[tuple[datetime, datetime]], day_start: datetime, day_end: datetime
 ) -> list[tuple[datetime, datetime]]:
-    return [(s, e) for s, e in blocks if s < day_end and e > day_start]
+    out: list[tuple[datetime, datetime]] = []
+    for s, e in blocks:
+        ns, ne = _naive_dt(s), _naive_dt(e)
+        if ns and ne and ns < day_end and ne > day_start:
+            out.append((ns, ne))
+    return out
 
 
 def employee_slot_conflicts(
@@ -358,8 +399,16 @@ def employee_slot_conflicts(
 
 
 def _overlaps(a_start: datetime, a_end: datetime, blocks: list[tuple[datetime, datetime]]) -> bool:
+    start = _naive_dt(a_start)
+    end = _naive_dt(a_end)
+    if start is None or end is None:
+        return False
     for b_start, b_end in blocks:
-        if a_start < b_end and a_end > b_start:
+        bs = _naive_dt(b_start)
+        be = _naive_dt(b_end)
+        if bs is None or be is None:
+            continue
+        if start < be and end > bs:
             return True
     return False
 
@@ -549,7 +598,7 @@ def get_availability(slug: str):
         Employee.query.filter_by(business_id=b.id, is_active=True).order_by(Employee.id).all()
     )
     if not employees:
-        return jsonify({"slots": [], "allow_any_barber": b.allow_any_barber}), 200
+        return _json_no_store({"slots": [], "allow_any_barber": b.allow_any_barber})
 
     slots_out: list[dict[str, Any]] = []
     shop_now = shop_local_now(b)
@@ -605,7 +654,7 @@ def get_availability(slug: str):
     else:
         return _json_error("Selecciona un barbero para ver horarios.", 400)
 
-    return jsonify({"slots": slots_out, "allow_any_barber": b.allow_any_barber}), 200
+    return _json_no_store({"slots": slots_out, "allow_any_barber": b.allow_any_barber})
 
 
 @public_booking.route("/booking/<slug>/calendar-hints", methods=["GET"])
@@ -641,7 +690,7 @@ def calendar_hints(slug: str):
         Employee.query.filter_by(business_id=b.id, is_active=True).order_by(Employee.id).all()
     )
     if not employees:
-        return jsonify({"days": {}}), 200
+        return _json_no_store({"days": {}})
 
     selected_emp: Employee | None = None
     if emp_uuid:
@@ -685,7 +734,7 @@ def calendar_hints(slug: str):
                 break
         days[d.isoformat()] = has
 
-    return jsonify({"days": days}), 200
+    return _json_no_store({"days": days})
 
 
 def _pick_employee_for_slot(
@@ -995,30 +1044,32 @@ def create_public_booking(slug: str):
     if abs((end - start) - expected_delta) > timedelta(seconds=1):
         return _json_error("La duración no coincide con el servicio.", 400)
 
+    employees = (
+        Employee.query.filter_by(business_id=b.id, is_active=True).order_by(Employee.id).all()
+    )
     if emp_req:
-        emp = Employee.query.filter_by(id=emp_req, business_id=b.id, is_active=True).first()
+        emp = next((e for e in employees if e.id == emp_req), None)
         if not emp:
             return _json_error("Barbero no encontrado.", 404)
-        chosen = emp
+        candidates = [emp]
     else:
         if not b.allow_any_barber:
             return _json_error("Debes elegir un barbero.", 400)
-        chosen = _pick_employee_for_slot(b, start, end, None)
-        if not chosen:
+        if not employees:
             return _json_error("Ese horario ya no está disponible.", 409)
+        candidates = employees
 
-    _advisory_lock_employee_booking(chosen.id)
-
-    day_start, day_end = _day_window_local(start.date())
-    busy = _busy_intervals(b.id, chosen.id, day_start, day_end)
-    if _overlaps(start, end, busy):
+    chosen = None
+    for emp in candidates:
+        _advisory_lock_employee_booking(emp.id)
+        if employee_slot_conflicts(b.id, emp.id, start, end):
+            continue
+        if not _slot_is_bookable(b, emp.id, start, end, dur_min):
+            continue
+        chosen = emp
+        break
+    if not chosen:
         return _json_error("Ese horario ya no está disponible.", 409)
-
-    if not _slot_is_bookable(b, chosen.id, start, end, dur_min):
-        return _json_error(
-            "Ese horario no está disponible en la agenda (fuera de horario o ya ocupado).",
-            409,
-        )
 
     if logged_client:
         client = logged_client

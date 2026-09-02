@@ -41,6 +41,7 @@ from app.appointment_lifecycle import (
     clear_reschedule_fields,
     propose_reschedule,
 )
+from app.public_booking import BLOCKING_STATUSES, employee_slot_conflicts
 from app.shop_datetime import format_shop_naive_iso, parse_shop_local_dt, shop_local_now
 from app.shop_insights import build_insights, parse_goals, serialize_goals
 from app.inventory_movements import (
@@ -149,6 +150,9 @@ def _normalize_business_hours_json(raw) -> tuple[str | None, str | None]:
     return json.dumps(normalized, ensure_ascii=False), None
 
 
+SLOT_TAKEN_MSG = "Ese horario ya está ocupado para este barbero."
+
+
 def _json_error(message: str, status_code: int = 400):
     return jsonify({"error": message}), status_code
 
@@ -195,6 +199,26 @@ def _normalize_appointment_status(status: str) -> str:
     if s == "pending":
         return "scheduled"
     return s
+
+
+def _reject_if_slot_taken(
+    business_id: uuid.UUID,
+    employee_id: uuid.UUID | None,
+    start: datetime | None,
+    end: datetime | None,
+    status: str | None,
+    exclude_id: uuid.UUID | None = None,
+):
+    if employee_id is None or start is None or end is None:
+        return None
+    st = _normalize_appointment_status(status or "scheduled")
+    if st not in BLOCKING_STATUSES:
+        return None
+    if employee_slot_conflicts(
+        business_id, employee_id, start, end, exclude_id=exclude_id
+    ):
+        return _json_error(SLOT_TAKEN_MSG, 409)
+    return None
 
 
 def _business_to_public(b: Business) -> dict:
@@ -641,6 +665,9 @@ def create_appointment(ctx: ShopContext):
         return _json_error("Empleado no encontrado.", 404)
 
     status = _normalize_appointment_status(payload.get("status", "scheduled"))
+    taken = _reject_if_slot_taken(ctx.business_id, eid, start, end, status)
+    if taken:
+        return taken
     notes = payload.get("notes")
 
     full_name = f"{client.first_name} {client.last_name}".strip()
@@ -790,6 +817,9 @@ def create_walk_in(ctx: ShopContext):
         nearest = min(allowed, key=lambda m: abs(m - start.minute))
         start = start.replace(minute=nearest)
     end = start + timedelta(minutes=duration)
+    taken = _reject_if_slot_taken(ctx.business_id, eid, start, end, "completed")
+    if taken:
+        return taken
 
     client = _find_or_create_walkin_client(
         ctx,
@@ -919,6 +949,18 @@ def update_appointment(ctx: ShopContext, appointment_id: str):
             clear_reschedule_fields(a)
     if "notes" in payload:
         a.notes = payload.get("notes")
+
+    taken = _reject_if_slot_taken(
+        ctx.business_id,
+        a.employee_id,
+        a.start_time,
+        a.end_time,
+        a.status,
+        exclude_id=a.id,
+    )
+    if taken:
+        db.session.rollback()
+        return taken
 
     if becoming_completed:
         try:
