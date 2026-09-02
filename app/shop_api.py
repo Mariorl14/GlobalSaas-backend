@@ -41,7 +41,7 @@ from app.appointment_lifecycle import (
     clear_reschedule_fields,
     propose_reschedule,
 )
-from app.shop_datetime import parse_shop_local_dt
+from app.shop_datetime import format_shop_naive_iso, parse_shop_local_dt, shop_local_now
 from app.shop_insights import build_insights, parse_goals, serialize_goals
 from app.inventory_movements import (
     InventoryMovementError,
@@ -270,17 +270,13 @@ def _appointment_to_dict(a: Appointment) -> dict:
         "client_name": a.client_name,
         "client_email": a.client_email,
         "client_phone": a.client_phone,
-        "start_time": a.start_time.isoformat() if a.start_time else None,
-        "end_time": a.end_time.isoformat() if a.end_time else None,
+        "start_time": format_shop_naive_iso(a.start_time),
+        "end_time": format_shop_naive_iso(a.end_time),
         "status": a.status,
         "notes": a.notes,
         "source": a.source,
-        "proposed_start_time": a.proposed_start_time.isoformat()
-        if a.proposed_start_time
-        else None,
-        "proposed_end_time": a.proposed_end_time.isoformat()
-        if a.proposed_end_time
-        else None,
+        "proposed_start_time": format_shop_naive_iso(a.proposed_start_time),
+        "proposed_end_time": format_shop_naive_iso(a.proposed_end_time),
         "cancel_reason": a.cancel_reason,
         "cancel_message": a.cancel_message,
     }
@@ -410,7 +406,8 @@ def shop_me(ctx: ShopContext):
 @shop_jwt_required
 def shop_dashboard(ctx: ShopContext):
     bid = ctx.business_id
-    now = datetime.utcnow()
+    business = Business.query.get(bid)
+    now = shop_local_now(business)
     day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     day_end = day_start + timedelta(days=1)
     week_end = day_start + timedelta(days=7)

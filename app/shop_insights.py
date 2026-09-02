@@ -66,13 +66,26 @@ _COUNTRY_TIMEZONES = {
 _DEFAULT_TZ_NAME = "America/Costa_Rica"
 
 
-def business_timezone(business: Business | None) -> ZoneInfo:
+def business_timezone(business: Business | None) -> ZoneInfo | timezone:
     code = ((getattr(business, "country_code", None) or "") or "").strip().upper()
     name = _COUNTRY_TIMEZONES.get(code, _DEFAULT_TZ_NAME)
-    try:
-        return ZoneInfo(name)
-    except Exception:
-        return ZoneInfo(_DEFAULT_TZ_NAME)
+    for candidate in (name, _DEFAULT_TZ_NAME, "UTC"):
+        try:
+            return ZoneInfo(candidate)
+        except Exception:
+            continue
+    # Windows/dev hosts without tzdata: Costa Rica is UTC-6 year-round.
+    offsets = {
+        "America/Costa_Rica": -6,
+        "America/Mexico_City": -6,
+        "America/Panama": -5,
+        "America/Guatemala": -6,
+        "America/Tegucigalpa": -6,
+        "America/Managua": -6,
+        "America/El_Salvador": -6,
+        "America/New_York": -5,
+    }
+    return timezone(timedelta(hours=offsets.get(name, -6)))
 
 
 def local_now(tz: ZoneInfo) -> datetime:
@@ -82,6 +95,14 @@ def local_now(tz: ZoneInfo) -> datetime:
 
 def utc_now_naive() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def _naive_wallclock_iso(dt: datetime | None, tz: ZoneInfo) -> str | None:
+    if dt is None:
+        return None
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(tz).replace(tzinfo=None)
+    return dt.replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%S")
 
 
 def local_to_utc_naive(local_naive: datetime, tz: ZoneInfo) -> datetime:
@@ -1888,8 +1909,8 @@ def build_insights(
                 "id": str(a.id),
                 "client_name": a.client_name,
                 "client_email": a.client_email,
-                "start_time": a.start_time.isoformat() if a.start_time else None,
-                "end_time": a.end_time.isoformat() if a.end_time else None,
+                "start_time": _naive_wallclock_iso(a.start_time, tz),
+                "end_time": _naive_wallclock_iso(a.end_time, tz),
                 "status": _status_norm(a.status),
                 "service_type_id": str(a.service_type_id),
                 "service_name": name_map.get(a.service_type_id),

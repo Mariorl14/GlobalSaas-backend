@@ -23,7 +23,11 @@ from app.extensions import db
 from app.models import Appointment, Business, Client, Employee, ServiceType
 from app.appointment_notifications import notify_appointment_created
 from app.name_utils import staff_display_label
-from app.shop_datetime import shop_local_now, shop_local_today
+from app.shop_datetime import (
+    format_shop_naive_iso,
+    parse_shop_local_dt,
+    shop_local_now,
+)
 
 public_booking = Blueprint("public_booking", __name__, url_prefix="/api/public")
 
@@ -289,6 +293,52 @@ def _busy_intervals(
     return blocks
 
 
+def _busy_blocks_for_employees(
+    business_id: uuid.UUID,
+    employee_ids: list[uuid.UUID],
+    range_start: datetime,
+    range_end: datetime,
+) -> dict[uuid.UUID, list[tuple[datetime, datetime]]]:
+    """One query for occupied windows across a date range, keyed by employee."""
+    out: dict[uuid.UUID, list[tuple[datetime, datetime]]] = {eid: [] for eid in employee_ids}
+    if not employee_ids:
+        return out
+    rows = Appointment.query.filter(
+        Appointment.business_id == business_id,
+        Appointment.employee_id.in_(employee_ids),
+        Appointment.status.in_(BLOCKING_STATUSES),
+        or_(
+            and_(Appointment.start_time < range_end, Appointment.end_time > range_start),
+            and_(
+                Appointment.proposed_start_time.isnot(None),
+                Appointment.proposed_start_time < range_end,
+                Appointment.proposed_end_time > range_start,
+            ),
+        ),
+    ).all()
+    for a in rows:
+        eid = a.employee_id
+        if eid is None:
+            continue
+        blocks = out.setdefault(eid, [])
+        if a.start_time and a.end_time and a.start_time < range_end and a.end_time > range_start:
+            blocks.append((a.start_time, a.end_time))
+        if (
+            a.proposed_start_time
+            and a.proposed_end_time
+            and a.proposed_start_time < range_end
+            and a.proposed_end_time > range_start
+        ):
+            blocks.append((a.proposed_start_time, a.proposed_end_time))
+    return out
+
+
+def _busy_on_day(
+    blocks: list[tuple[datetime, datetime]], day_start: datetime, day_end: datetime
+) -> list[tuple[datetime, datetime]]:
+    return [(s, e) for s, e in blocks if s < day_end and e > day_start]
+
+
 def employee_slot_conflicts(
     business_id: uuid.UUID,
     employee_id: uuid.UUID,
@@ -320,22 +370,32 @@ def _iter_slots_for_employee(
     d: date,
     duration_min: int,
     now: datetime | None = None,
+    *,
+    employee: Employee | None = None,
+    busy: list[tuple[datetime, datetime]] | None = None,
+    stop_after: int | None = None,
 ) -> list[tuple[datetime, datetime]]:
-    emp = Employee.query.filter_by(
-        id=employee_id, business_id=business.id, is_active=True
-    ).first()
+    shop_now = now if now is not None else shop_local_now(business)
+    today = shop_now.date()
+    if d < today:
+        return []
+
+    emp = employee
+    if emp is None or emp.id != employee_id:
+        emp = Employee.query.filter_by(
+            id=employee_id, business_id=business.id, is_active=True
+        ).first()
     if not emp:
         return []
 
     wd = d.weekday()
     intervals = _open_intervals_for_employee(business, emp, wd)
     day_start, day_end = _day_window_local(d)
-    busy = _busy_intervals(business.id, emp.id, day_start, day_end)
+    if busy is None:
+        busy = _busy_intervals(business.id, emp.id, day_start, day_end)
     step = timedelta(minutes=SLOT_STEP_MINUTES)
     duration = timedelta(minutes=duration_min)
     slots: list[tuple[datetime, datetime]] = []
-    shop_now = now if now is not None else shop_local_now(business)
-    today = shop_now.date()
 
     for open_t, close_t in intervals:
         open_dt = datetime.combine(d, open_t)
@@ -353,6 +413,8 @@ def _iter_slots_for_employee(
             end = t + duration
             if not _overlaps(t, end, busy):
                 slots.append((t, end))
+                if stop_after is not None and len(slots) >= stop_after:
+                    return slots
             t += step
     return slots
 
@@ -490,30 +552,52 @@ def get_availability(slug: str):
         return jsonify({"slots": [], "allow_any_barber": b.allow_any_barber}), 200
 
     slots_out: list[dict[str, Any]] = []
+    shop_now = shop_local_now(b)
+    day_start, day_end = _day_window_local(d)
 
     if emp_uuid:
-        emp = Employee.query.filter_by(id=emp_uuid, business_id=b.id, is_active=True).first()
+        emp = next((e for e in employees if e.id == emp_uuid), None)
         if not emp:
             return _json_error("Barbero no encontrado.", 404)
-        for start, end in _iter_slots_for_employee(b, emp.id, d, duration):
+        busy_map = _busy_blocks_for_employees(b.id, [emp.id], day_start, day_end)
+        for start, end in _iter_slots_for_employee(
+            b,
+            emp.id,
+            d,
+            duration,
+            now=shop_now,
+            employee=emp,
+            busy=busy_map.get(emp.id, []),
+        ):
             slots_out.append(
                 {
-                    "start": start.isoformat(),
-                    "end": end.isoformat(),
+                    "start": format_shop_naive_iso(start) or start.isoformat(),
+                    "end": format_shop_naive_iso(end) or end.isoformat(),
                     "employee_id": str(emp.id),
                 }
             )
     elif b.allow_any_barber:
         seen: set[str] = set()
+        busy_map = _busy_blocks_for_employees(
+            b.id, [e.id for e in employees], day_start, day_end
+        )
         for emp in employees:
-            for start, end in _iter_slots_for_employee(b, emp.id, d, duration):
+            for start, end in _iter_slots_for_employee(
+                b,
+                emp.id,
+                d,
+                duration,
+                now=shop_now,
+                employee=emp,
+                busy=busy_map.get(emp.id, []),
+            ):
                 key = start.isoformat()
                 if key not in seen:
                     seen.add(key)
                     slots_out.append(
                         {
-                            "start": start.isoformat(),
-                            "end": end.isoformat(),
+                            "start": format_shop_naive_iso(start) or start.isoformat(),
+                            "end": format_shop_naive_iso(end) or end.isoformat(),
                             "employee_id": None,
                         }
                     )
@@ -561,9 +645,7 @@ def calendar_hints(slug: str):
 
     selected_emp: Employee | None = None
     if emp_uuid:
-        selected_emp = Employee.query.filter_by(
-            id=emp_uuid, business_id=b.id, is_active=True
-        ).first()
+        selected_emp = next((e for e in employees if e.id == emp_uuid), None)
         if not selected_emp:
             return _json_error("Barbero no encontrado.", 404)
 
@@ -572,23 +654,36 @@ def calendar_hints(slug: str):
 
     _, last_day = monthrange(year, month)
     days: dict[str, bool] = {}
-    today = shop_local_today(b)
+    shop_now = shop_local_now(b)
+    today = shop_now.date()
+    month_start, _ = _day_window_local(date(year, month, 1))
+    _, month_end = _day_window_local(date(year, month, last_day))
+    hint_emps = [selected_emp] if selected_emp is not None else list(employees)
+    busy_map = _busy_blocks_for_employees(
+        b.id, [e.id for e in hint_emps], month_start, month_end
+    )
 
     for day_n in range(1, last_day + 1):
         d = date(year, month, day_n)
         if d < today:
             days[d.isoformat()] = False
             continue
-        count = 0
-        if selected_emp is not None:
-            count = len(_iter_slots_for_employee(b, selected_emp.id, d, duration))
-        elif b.allow_any_barber:
-            seen = set()
-            for emp in employees:
-                for start, _ in _iter_slots_for_employee(b, emp.id, d, duration):
-                    seen.add(start.isoformat())
-            count = len(seen)
-        days[d.isoformat()] = count > 0
+        day_start, day_end = _day_window_local(d)
+        has = False
+        for emp in hint_emps:
+            if _iter_slots_for_employee(
+                b,
+                emp.id,
+                d,
+                duration,
+                now=shop_now,
+                employee=emp,
+                busy=_busy_on_day(busy_map.get(emp.id, []), day_start, day_end),
+                stop_after=1,
+            ):
+                has = True
+                break
+        days[d.isoformat()] = has
 
     return jsonify({"days": days}), 200
 
@@ -833,8 +928,8 @@ def create_public_booking(slug: str):
 
     payload = request.get_json(silent=True) or {}
     sid = _parse_uuid(payload.get("service_id"))
-    start_raw = _parse_dt(payload.get("start_time"))
-    end_raw = _parse_dt(payload.get("end_time"))
+    start_raw = parse_shop_local_dt(payload.get("start_time"), b.id)
+    end_raw = parse_shop_local_dt(payload.get("end_time"), b.id)
 
     logged_client = _optional_logged_in_client(b.id)
 
@@ -873,6 +968,10 @@ def create_public_booking(slug: str):
 
     if end <= start:
         return _json_error("Horario inválido.", 400)
+
+    shop_now = shop_local_now(b)
+    if start < shop_now:
+        return _json_error("Ese horario ya pasó. Elige una hora posterior.", 409)
 
     if not _is_on_slot_grid(start):
         return _json_error(
