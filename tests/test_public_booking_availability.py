@@ -144,8 +144,16 @@ def test_public_booking_shows_on_shop_calendar_day(_mock_slot, _mock_send, clien
         assert match["status"] == "confirmed"
 
 
-@patch("app.public_booking.notify_appointment_created", return_value={"status": "skipped"})
-def test_booked_slot_is_removed_and_cannot_be_taken_again(_mock_send, client, app):
+@patch(
+    "app.public_booking.notify_appointment_created",
+    return_value={
+        "status": "sent",
+        "email": "sent",
+        "staff_email": "skipped",
+        "whatsapp": "skipped",
+    },
+)
+def test_booked_slot_is_removed_and_cannot_be_taken_again(mock_send, client, app):
     """A confirmed booking occupies that barber; the public page must not offer it again."""
     with app.app_context():
         bundle = create_tenant_bundle(slug=f"busy-{uuid.uuid4().hex[:8]}", country_code="CR")
@@ -161,16 +169,20 @@ def test_booked_slot_is_removed_and_cannot_be_taken_again(_mock_send, client, ap
             "end_time": end.isoformat(),
             "first_name": "Ana",
             "last_name": "Solís",
+            "email": "ana@test.com",
+        }
+        avail_q = {
+            "date": "2026-08-28",
+            "service_id": service_id,
+            "employee_id": employee_id,
+            "_t": "123",
         }
 
         with patch("app.public_booking.shop_local_now", return_value=_SHOP_AFTERNOON):
             before = client.get(
                 f"/api/public/booking/{slug}/availability",
-                query_string={
-                    "date": "2026-08-28",
-                    "service_id": service_id,
-                    "employee_id": employee_id,
-                },
+                query_string=avail_q,
+                headers={"Cache-Control": "no-cache", "Pragma": "no-cache"},
             )
             assert before.status_code == 200, before.get_data(as_text=True)
             assert "no-store" in (before.headers.get("Cache-Control") or "").lower()
@@ -178,14 +190,15 @@ def test_booked_slot_is_removed_and_cannot_be_taken_again(_mock_send, client, ap
 
             booked = client.post(f"/api/public/booking/{slug}/bookings", json=body)
             assert booked.status_code == 201, booked.get_data(as_text=True)
+            payload = booked.get_json()
+            assert payload["message"] == "Reserva confirmada."
+            assert payload["notification_status"] == "sent"
+            assert payload["email_notification_status"] == "sent"
+            mock_send.assert_called_once()
 
             after = client.get(
                 f"/api/public/booking/{slug}/availability",
-                query_string={
-                    "date": "2026-08-28",
-                    "service_id": service_id,
-                    "employee_id": employee_id,
-                },
+                query_string=avail_q,
             )
             assert after.status_code == 200, after.get_data(as_text=True)
             starts = [s["start"] for s in after.get_json()["slots"]]
@@ -195,6 +208,25 @@ def test_booked_slot_is_removed_and_cannot_be_taken_again(_mock_send, client, ap
 
             again = client.post(f"/api/public/booking/{slug}/bookings", json=body)
             assert again.status_code == 409, again.get_data(as_text=True)
+            mock_send.assert_called_once()
+
+
+def test_public_availability_cors_preflight_allows_browser_headers(client, app):
+    with app.app_context():
+        bundle = create_tenant_bundle(slug=f"cors-{uuid.uuid4().hex[:8]}", country_code="CR")
+        res = client.options(
+            f"/api/public/booking/{bundle['business'].public_slug}/availability",
+            headers={
+                "Origin": "https://mrsolutionscostarica.com",
+                "Access-Control-Request-Method": "GET",
+                "Access-Control-Request-Headers": "cache-control,pragma",
+            },
+        )
+        assert res.status_code in (200, 204), res.get_data(as_text=True)
+        allow = (res.headers.get("Access-Control-Allow-Headers") or "").lower()
+        assert "cache-control" in allow
+        origin = res.headers.get("Access-Control-Allow-Origin")
+        assert origin in ("*", "https://mrsolutionscostarica.com")
 
 
 @patch("app.public_booking.notify_appointment_created", return_value={"status": "skipped"})

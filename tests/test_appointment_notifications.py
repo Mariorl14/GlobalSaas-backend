@@ -1,4 +1,5 @@
 import json
+import uuid
 from datetime import datetime, timedelta
 from unittest.mock import MagicMock, patch
 
@@ -194,32 +195,32 @@ class TestPublicBookingIntegration:
         "app.public_booking.notify_appointment_created",
         return_value={"status": "sent", "email": "sent", "whatsapp": "skipped"},
     )
-    @patch("app.public_booking._slot_is_bookable", return_value=True)
     def test_successful_booking_calls_notification_after_commit(
-        self, _mock_slot, mock_send, client, app
+        self, mock_send, client, app
     ):
-        bundle = create_tenant_bundle()
-        start = datetime.now().replace(second=0, microsecond=0) + timedelta(days=2)
-        start = start.replace(minute=0, second=0, microsecond=0)
+        bundle = create_tenant_bundle(slug=f"notify-{uuid.uuid4().hex[:8]}", country_code="CR")
+        start = datetime(2026, 8, 28, 16, 0, 0)
         end = start + timedelta(minutes=30)
 
         with app.app_context():
-            resp = client.post(
-                f"/api/public/booking/{bundle['business'].public_slug}/bookings",
-                json={
-                    "service_id": str(bundle["service"].id),
-                    "employee_id": str(bundle["employee"].id),
-                    "start_time": start.isoformat(),
-                    "end_time": end.isoformat(),
-                    "first_name": "Ana",
-                    "last_name": "Pérez",
-                    "phone": "88887777",
-                    "email": "ana@test.com",
-                },
-            )
+            with patch("app.public_booking.shop_local_now", return_value=datetime(2026, 8, 28, 15, 0, 0)):
+                resp = client.post(
+                    f"/api/public/booking/{bundle['business'].public_slug}/bookings",
+                    json={
+                        "service_id": str(bundle["service"].id),
+                        "employee_id": str(bundle["employee"].id),
+                        "start_time": start.isoformat(),
+                        "end_time": end.isoformat(),
+                        "first_name": "Ana",
+                        "last_name": "Pérez",
+                        "phone": "88887777",
+                        "email": "ana@test.com",
+                    },
+                )
 
-        assert resp.status_code == 201
+        assert resp.status_code == 201, resp.get_data(as_text=True)
         body = resp.get_json()
+        assert body["message"] == "Reserva confirmada."
         assert body["notification_status"] == "sent"
         assert body["email_notification_status"] == "sent"
         mock_send.assert_called_once()
