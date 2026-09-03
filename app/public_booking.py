@@ -118,6 +118,26 @@ def _is_on_slot_grid(dt: datetime) -> bool:
     )
 
 
+_ALLOWED_MINUTES_SORTED = tuple(sorted(SLOT_ALLOWED_MINUTES))
+
+
+def _ceil_allowed(dt: datetime) -> datetime:
+    """Next grid clock at or after dt (seconds stripped)."""
+    dt = dt.replace(second=0, microsecond=0)
+    minute = dt.minute
+    for m in _ALLOWED_MINUTES_SORTED:
+        if m >= minute:
+            return dt.replace(minute=m)
+    return dt.replace(minute=0) + timedelta(hours=1)
+
+
+def _next_allowed(dt: datetime) -> datetime:
+    for m in _ALLOWED_MINUTES_SORTED:
+        if m > dt.minute:
+            return dt.replace(minute=m, second=0, microsecond=0)
+    return dt.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+
+
 def _advisory_lock_employee_booking(employee_id: uuid.UUID) -> None:
     """
     Serialize concurrent public bookings for the same employee (PostgreSQL only).
@@ -404,11 +424,7 @@ def _overlaps(a_start: datetime, a_end: datetime, blocks: list[tuple[datetime, d
     if start is None or end is None:
         return False
     for b_start, b_end in blocks:
-        bs = _naive_dt(b_start)
-        be = _naive_dt(b_end)
-        if bs is None or be is None:
-            continue
-        if start < be and end > bs:
+        if start < b_end and end > b_start:
             return True
     return False
 
@@ -422,6 +438,7 @@ def _iter_slots_for_employee(
     *,
     employee: Employee | None = None,
     busy: list[tuple[datetime, datetime]] | None = None,
+    intervals: list[tuple[time, time]] | None = None,
     stop_after: int | None = None,
 ) -> list[tuple[datetime, datetime]]:
     shop_now = now if now is not None else shop_local_now(business)
@@ -438,11 +455,18 @@ def _iter_slots_for_employee(
         return []
 
     wd = d.weekday()
-    intervals = _open_intervals_for_employee(business, emp, wd)
+    if intervals is None:
+        intervals = _open_intervals_for_employee(business, emp, wd)
+    if not intervals:
+        return []
     day_start, day_end = _day_window_local(d)
     if busy is None:
         busy = _busy_intervals(business.id, emp.id, day_start, day_end)
-    step = timedelta(minutes=SLOT_STEP_MINUTES)
+    busy_n: list[tuple[datetime, datetime]] = []
+    for s, e in busy:
+        ns, ne = _naive_dt(s), _naive_dt(e)
+        if ns and ne:
+            busy_n.append((ns, ne))
     duration = timedelta(minutes=duration_min)
     slots: list[tuple[datetime, datetime]] = []
 
@@ -451,20 +475,18 @@ def _iter_slots_for_employee(
         close_dt = datetime.combine(d, close_t)
         if close_dt <= open_dt:
             continue
-        t = open_dt
+        t = _ceil_allowed(open_dt)
+        if d == today and t < shop_now:
+            t = _ceil_allowed(shop_now)
+            if t < shop_now:
+                t = _next_allowed(t)
         while t + duration <= close_dt:
-            if t.minute not in SLOT_ALLOWED_MINUTES:
-                t += step
-                continue
-            if d == today and t < shop_now:
-                t += step
-                continue
             end = t + duration
-            if not _overlaps(t, end, busy):
+            if not _overlaps(t, end, busy_n):
                 slots.append((t, end))
                 if stop_after is not None and len(slots) >= stop_after:
                     return slots
-            t += step
+            t = _next_allowed(t)
     return slots
 
 
@@ -472,6 +494,9 @@ def _get_business_by_slug(slug: str) -> Business | None:
     if not slug or not re.match(r"^[a-zA-Z0-9\-]+$", slug):
         return None
     s = slug.strip().lower()
+    row = Business.query.filter_by(public_slug=s).first()
+    if row:
+        return row
     return Business.query.filter(func.lower(Business.public_slug) == s).first()
 
 
@@ -533,16 +558,15 @@ def get_public_bootstrap(slug: str):
     b = _get_business_by_slug(slug)
     if not b or not b.is_active:
         return _json_error("Barbería no encontrada.", 404)
-    return (
-        jsonify(
-            {
-                "business": _public_business_dict(b),
-                "services": _public_services_list(b),
-                "barbers": _public_barbers_list(b),
-            }
-        ),
-        200,
+    resp = jsonify(
+        {
+            "business": _public_business_dict(b),
+            "services": _public_services_list(b),
+            "barbers": _public_barbers_list(b),
+        }
     )
+    resp.headers["Cache-Control"] = "public, max-age=30, stale-while-revalidate=120"
+    return resp, 200
 
 
 @public_booking.route("/booking/<slug>", methods=["GET"])
@@ -711,6 +735,7 @@ def calendar_hints(slug: str):
     busy_map = _busy_blocks_for_employees(
         b.id, [e.id for e in hint_emps], month_start, month_end
     )
+    hours_cache: dict[tuple[uuid.UUID, int], list[tuple[time, time]]] = {}
 
     for day_n in range(1, last_day + 1):
         d = date(year, month, day_n)
@@ -718,8 +743,15 @@ def calendar_hints(slug: str):
             days[d.isoformat()] = False
             continue
         day_start, day_end = _day_window_local(d)
+        wd = d.weekday()
         has = False
         for emp in hint_emps:
+            iv_key = (emp.id, wd)
+            if iv_key not in hours_cache:
+                hours_cache[iv_key] = _open_intervals_for_employee(b, emp, wd)
+            intervals = hours_cache[iv_key]
+            if not intervals:
+                continue
             if _iter_slots_for_employee(
                 b,
                 emp.id,
@@ -728,6 +760,7 @@ def calendar_hints(slug: str):
                 now=shop_now,
                 employee=emp,
                 busy=_busy_on_day(busy_map.get(emp.id, []), day_start, day_end),
+                intervals=intervals,
                 stop_after=1,
             ):
                 has = True
