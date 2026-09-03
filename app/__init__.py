@@ -27,7 +27,15 @@ def create_app():
         app,
         resources={r"/*": {"origins": "*"}},
         supports_credentials=False,
-        allow_headers=["Authorization", "Content-Type", "Accept", "Origin", "X-Requested-With"],
+        allow_headers=[
+            "Authorization",
+            "Content-Type",
+            "Accept",
+            "Origin",
+            "X-Requested-With",
+            "Cache-Control",
+            "Pragma",
+        ],
         methods=["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
         expose_headers=["Content-Type"],
     )
